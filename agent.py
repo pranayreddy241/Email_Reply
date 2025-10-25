@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Baseline Restaurant Email Agent
-- IMAP fetch unseen
+Baseline Restaurant Email Agent (Gmail API / OAuth)
+- Fetch unread messages (INBOX) via Gmail API
 - Classify: reservation/review/other (regex rules)
 - Auto-reply reservations (confirm or ask missing details)
 - Stage non-urgent replies as local SQLite drafts
@@ -10,22 +10,30 @@ Baseline Restaurant Email Agent
 Usage:
   python agent.py
   python agent.py --send-pending
+
 Env (example):
-  EMAIL_ADDRESS=20131a0522@gvpce.ac.in
-  EMAIL_PASSWORD=app-password
-  IMAP_SERVER=imap.gmail.com  SMTP_SERVER=smtp.gmail.com  SMTP_PORT=587
-  RESTAURANT_NAME="Your Restaurant"  RESERVATION_PHONE="+1..."  RESERVATION_LINK="https://..."
+  RESTAURANT_NAME="Your Restaurant"
+  RESERVATION_PHONE="+1..."
+  RESERVATION_LINK="https://..."
+  AGENT_DB_PATH="email_agent.sqlite"
+
+Files required:
+  - client_secret.json (OAuth client credentials)
+  - token.json (created automatically on first run)
 """
-import os, re, sqlite3, imaplib, smtplib, email
+
+from __future__ import print_function
+
+import os, re, sqlite3, email, base64
 from email.message import EmailMessage
 from email.header import decode_header, make_header
-from email.utils import parseaddr, formatdate
 
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+# ----------------- Config -----------------
 RESTAURANT_NAME = os.getenv("RESTAURANT_NAME", "My Restaurant")
 RESERVATION_PHONE = os.getenv("RESERVATION_PHONE", "")
 RESERVATION_LINK = os.getenv("RESERVATION_LINK", "")
@@ -37,10 +45,32 @@ DATE_RE = r"(?:(?:on\s*)?(?P<date>(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)|(?:jan|
 TIME_RE = r"(?:(?:at\s*)?(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|\b)))"
 PARTY_RE = r"(?:(?:for|party of)\s*(?P<party>\d{1,2}))"
 
-def _dec(s): 
-    if not s: return ""
-    try: return str(make_header(decode_header(s)))
-    except: return s
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+# ----------------- Gmail API auth -----------------
+def get_gmail_service():
+    """Authenticate (OAuth) and return a Gmail API service."""
+    creds = None
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open("token.json", "w") as token:
+            token.write(creds.to_json())
+    return build("gmail", "v1", credentials=creds)
+
+# ----------------- Helpers -----------------
+def _dec(s):
+    if not s:
+        return ""
+    try:
+        return str(make_header(decode_header(s)))
+    except Exception:
+        return s
 
 def _body(msg):
     if msg.is_multipart():
@@ -55,121 +85,181 @@ def _body(msg):
             disp = str(part.get("Content-Disposition"))
             if ctype == "text/html" and "attachment" not in disp:
                 cs = part.get_content_charset() or "utf-8"
-                import re
                 html = part.get_payload(decode=True).decode(cs, errors="replace")
                 text = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
                 return re.sub(r'<[^>]+>', ' ', text)
     else:
         cs = msg.get_content_charset() or "utf-8"
         raw = msg.get_payload(decode=True)
-        if raw is None: return msg.get_payload()
+        if raw is None:
+            return msg.get_payload()
         text = raw.decode(cs, errors="replace")
-        if msg.get_content_type()=="text/html":
-            import re
-            text = re.sub(r'<br\s*/?>','\n',text,flags=re.I)
-            text = re.sub(r'<[^>]+>',' ',text)
+        if msg.get_content_type() == "text/html":
+            text = re.sub(r'<br\s*/?>', '\n', text, flags=re.I)
+            text = re.sub(r'<[^>]+>', ' ', text)
         return text
     return ""
 
-def _send(to_addr, subject, body, in_reply_to=None):
+def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
+    """Send a message via Gmail API."""
     m = EmailMessage()
-    m["From"]=EMAIL_ADDRESS; m["To"]=to_addr; m["Subject"]=subject; m["Date"]=formatdate(localtime=True)
-    if in_reply_to: m["In-Reply-To"]=in_reply_to; m["References"]=in_reply_to
+    # Use authenticated user's email as sender
+    sender_email = service.users().getProfile(userId="me").execute().get("emailAddress", "me")
+    m["From"] = sender_email
+    m["To"] = to_addr
+    m["Subject"] = subject
+    if in_reply_to:
+        m["In-Reply-To"] = in_reply_to
+        m["References"]  = in_reply_to
     m.set_content(body)
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
-        s.starttls(); s.login(EMAIL_ADDRESS, EMAIL_PASSWORD); s.send_message(m)
+
+    raw = base64.urlsafe_b64encode(m.as_bytes()).decode("utf-8")
+    payload = {"raw": raw}
+    if thread_id:
+        payload["threadId"] = thread_id
+    return service.users().messages().send(userId="me", body=payload).execute()
 
 def _classify(text):
-    t=text.lower()
-    if any(re.search(p,t) for p in RESERVATION_KEYWORDS): return "reservation"
-    if any(re.search(p,t) for p in REVIEW_KEYWORDS): return "review"
+    t = text.lower()
+    if any(re.search(p, t) for p in RESERVATION_KEYWORDS): return "reservation"
+    if any(re.search(p, t) for p in REVIEW_KEYWORDS):      return "review"
     return "other"
 
 def _extract(text):
-    import re
-    d=re.search(DATE_RE,text,flags=re.I); t=re.search(TIME_RE,text,flags=re.I); p=re.search(PARTY_RE,text,flags=re.I)
-    det={"date": d.group("date") if d else None,
-         "time": (t.group("time") if t else None),
-         "party_size": p.group("party") if p else None}
-    if det["time"] and re.fullmatch(r"\\d{1,2}", det["time"].strip()): det["time"] += ":00"
+    d = re.search(DATE_RE, text, flags=re.I)
+    t = re.search(TIME_RE, text, flags=re.I)
+    p = re.search(PARTY_RE, text, flags=re.I)
+    det = {
+        "date": d.group("date") if d else None,
+        "time": (t.group("time") if t else None),
+        "party_size": p.group("party") if p else None
+    }
+    # If time is just an hour like "7" or "10", normalize to "7:00"
+    if det["time"] and re.fullmatch(r"\d{1,2}", det["time"].strip()):
+        det["time"] += ":00"
     return det
 
-def _tpl_confirm(name,d,t,p):
-    L=[f"Hi{(' '+name) if name else ''},","",f"Your reservation is confirmed at {RESTAURANT_NAME}.",
-       f"• Date: {d}",f"• Time: {t}",f"• Party size: {p}"]
-    if RESERVATION_LINK: L.append(f"Modify/cancel: {RESERVATION_LINK}")
+def _tpl_confirm(name, d, t, p):
+    L = [
+        f"Hi{(' ' + name) if name else ''},",
+        "",
+        f"Your reservation is confirmed at {RESTAURANT_NAME}.",
+        f"• Date: {d}",
+        f"• Time: {t}",
+        f"• Party size: {p}"
+    ]
+    if RESERVATION_LINK:  L.append(f"Modify/cancel: {RESERVATION_LINK}")
     if RESERVATION_PHONE: L.append(f"Phone: {RESERVATION_PHONE}")
-    L+=["","We look forward to hosting you!",f"— {RESTAURANT_NAME}"]; return "\\n".join(L)
+    L += ["", "We look forward to hosting you!", f"— {RESTAURANT_NAME}"]
+    return "\n".join(L)
 
-def _tpl_missing(name,hd,ht,hp):
-    miss=[x for x,v in {"date":hd,"time":ht,"party size":hp}.items() if not v]
-    L=[f"Hi{(' '+name) if name else ''},",f"Thanks for booking at {RESTAURANT_NAME}.",
-       "Could you confirm your "+", ".join(miss)+" so we can finalize your reservation?"]
-    if RESERVATION_LINK: L.append(f"You can also book directly here: {RESERVATION_LINK}")
-    L+=["","Best,",RESTAURANT_NAME]; return "\\n".join(L)
+def _tpl_missing(name, hd, ht, hp):
+    miss = [x for x, v in {"date": hd, "time": ht, "party size": hp}.items() if not v]
+    L = [
+        f"Hi{(' ' + name) if name else ''},",
+        f"Thanks for booking at {RESTAURANT_NAME}.",
+        "Could you confirm your " + ", ".join(miss) + " so we can finalize your reservation?"
+    ]
+    if RESERVATION_LINK:
+        L.append(f"You can also book directly here: {RESERVATION_LINK}")
+    L += ["", "Best,", RESTAURANT_NAME]
+    return "\n".join(L)
 
 def _tpl_review(name):
-    return f"Hi{(' '+name) if name else ''},\\n\\nThank you for your feedback about {RESTAURANT_NAME}. We appreciate it!\\n\\n— {RESTAURANT_NAME}\\n"
+    return f"Hi{(' ' + name) if name else ''},\n\nThank you for your feedback about {RESTAURANT_NAME}. We appreciate it!\n\n— {RESTAURANT_NAME}\n"
 
 def _tpl_other(name):
-    return f"Hi{(' '+name) if name else ''},\\n\\nThanks for reaching out to {RESTAURANT_NAME}. We'll get back to you shortly.\\n\\n— {RESTAURANT_NAME}\\n"
+    return f"Hi{(' ' + name) if name else ''},\n\nThanks for reaching out to {RESTAURANT_NAME}. We'll get back to you shortly.\n\n— {RESTAURANT_NAME}\n"
 
 def _db():
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS processed(message_id TEXT PRIMARY KEY, processed_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS drafts(id INTEGER PRIMARY KEY, to_email TEXT, subject TEXT, body TEXT, in_reply_to TEXT, created_at TEXT, sent_at TEXT)")
-    conn.commit(); return conn
+    conn.commit()
+    return conn
 
-def _fetch_unseen():
-    M=imaplib.IMAP4_SSL(IMAP_SERVER); M.login(EMAIL_ADDRESS, EMAIL_PASSWORD); M.select("INBOX")
-    typ,data=M.search(None,'(UNSEEN)'); ids=data[0].split() if typ=="OK" else []
-    out=[]
-    for uid in ids:
-        typ,msg_data=M.fetch(uid,"(RFC822)")
-        if typ=="OK": out.append(msg_data[0][1])
-    M.close(); M.logout(); return out
+def _fetch_unseen(service):
+    """Return list of tuples: (msg_id, thread_id, raw_bytes) for unread INBOX messages."""
+    out = []
+    resp = service.users().messages().list(userId="me", labelIds=["INBOX"], q="is:unread", maxResults=50).execute()
+    for m in resp.get("messages", []):
+        msg_id = m["id"]
+        # get threadId for proper threading
+        meta = service.users().messages().get(userId="me", id=msg_id, format="metadata").execute()
+        thread_id = meta.get("threadId")
+        raw_resp = service.users().messages().get(userId="me", id=msg_id, format="raw").execute()
+        raw_bytes = base64.urlsafe_b64decode(raw_resp["raw"])
+        out.append((msg_id, thread_id, raw_bytes))
+        # mark as read immediately (optional)
+        service.users().messages().modify(userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}).execute()
+    return out
 
-def handle(conn, raw):
-    msg=email.message_from_bytes(raw)
-    mid=msg.get("Message-ID"); c=conn.cursor()
-    if mid and c.execute("SELECT 1 FROM processed WHERE message_id=?",(mid,)).fetchone(): return
-    subj=_dec(msg.get("Subject","")); body=_body(msg)
-    from_email=email.utils.parseaddr(msg.get("From",""))[1]
-    name=email.utils.parseaddr(msg.get("From",""))[0]
-    text=subj+" "+body
-    label=_classify(text)
-    if label=="reservation":
-        det=_extract(text); hd,ht,hp=bool(det["date"]),bool(det["time"]),bool(det["party_size"])
+def handle(service, conn, raw, thread_id):
+    msg = email.message_from_bytes(raw)
+    mid = msg.get("Message-ID")
+    c = conn.cursor()
+    if mid and c.execute("SELECT 1 FROM processed WHERE message_id=?", (mid,)).fetchone():
+        return
+
+    subj = _dec(msg.get("Subject", ""))
+    body = _body(msg)
+    from_email = email.utils.parseaddr(msg.get("From", ""))[1]
+    name = email.utils.parseaddr(msg.get("From", ""))[0]
+
+    label = _classify(subj + " " + body)
+
+    if label == "reservation":
+        det = _extract(subj + " " + body)
+        hd, ht, hp = bool(det["date"]), bool(det["time"]), bool(det["party_size"])
         if hd and ht and hp:
-            _send(from_email, f"Re: {subj} — Reservation Confirmed", _tpl_confirm(name,det["date"],det["time"],det["party_size"]), in_reply_to=mid)
+            _send(service, from_email, f"Re: {subj} — Reservation Confirmed",
+                  _tpl_confirm(name, det["date"], det["time"], det["party_size"]),
+                  in_reply_to=mid, thread_id=thread_id)
             print("[SENT] confirm ->", from_email)
         else:
-            _send(from_email, f"Re: {subj} — One quick detail", _tpl_missing(name,hd,ht,hp), in_reply_to=mid)
+            _send(service, from_email, f"Re: {subj} — One quick detail",
+                  _tpl_missing(name, hd, ht, hp),
+                  in_reply_to=mid, thread_id=thread_id)
             print("[SENT] missing ->", from_email)
     else:
-        if label=="review":
-            dsubj=f"Re: {subj} — Thank you"; dbody=_tpl_review(name)
-        else:
-            dsubj=f"Re: {subj}"; dbody=_tpl_other(name)
-        c.execute("INSERT INTO drafts(to_email,subject,body,in_reply_to,created_at) VALUES (?,?,?,?,datetime('now'))",
-                  (from_email,dsubj,dbody,mid)); conn.commit()
+        dsubj = f"Re: {subj} — Thank you" if label == "review" else f"Re: {subj}"
+        dbody = _tpl_review(name) if label == "review" else _tpl_other(name)
+        c.execute(
+            "INSERT INTO drafts(to_email,subject,body,in_reply_to,created_at) VALUES (?,?,?,?,datetime('now'))",
+            (from_email, dsubj, dbody, mid)
+        )
+        conn.commit()
         print("[DRAFTED] ->", from_email)
-    if mid:
-        c.execute("INSERT OR IGNORE INTO processed(message_id,processed_at) VALUES(?,datetime('now'))",(mid,)); conn.commit()
 
-def send_pending(conn):
-    c=conn.cursor()
-    for did,to_email,subject,body,in_reply_to in c.execute("SELECT id,to_email,subject,body,in_reply_to FROM drafts WHERE sent_at IS NULL ORDER BY id"):
-        _send(to_email,subject,body,in_reply_to); c.execute("UPDATE drafts SET sent_at=datetime('now') WHERE id=?",(did,)); conn.commit(); print("[SENT draft]",did)
+    if mid:
+        c.execute("INSERT OR IGNORE INTO processed(message_id,processed_at) VALUES(?,datetime('now'))", (mid,))
+        conn.commit()
+
+def send_pending(service, conn):
+    c = conn.cursor()
+    for did, to_email, subject, body, in_reply_to in c.execute(
+        "SELECT id,to_email,subject,body,in_reply_to FROM drafts WHERE sent_at IS NULL ORDER BY id"
+    ):
+        _send(service, to_email, subject, body, in_reply_to=in_reply_to, thread_id=None)
+        c.execute("UPDATE drafts SET sent_at=datetime('now') WHERE id=?", (did,))
+        conn.commit()
+        print("[SENT draft]", did)
 
 def main():
-    if not EMAIL_ADDRESS or not EMAIL_PASSWORD: raise SystemExit("Set EMAIL_ADDRESS and EMAIL_PASSWORD")
-    import sys
-    conn=_db()
-    if "--send-pending" in sys.argv: send_pending(conn); return
-    for raw in _fetch_unseen():
-        try: handle(conn, raw)
-        except Exception as e: print("[ERR]", e)
+    service = get_gmail_service()
+    conn = _db()
 
-if __name__=="__main__":
+    import sys
+    if "--send-pending" in sys.argv:
+        send_pending(service, conn)
+        return
+
+    for msg_id, thread_id, raw in _fetch_unseen(service):
+        try:
+            handle(service, conn, raw, thread_id)
+        except Exception as e:
+            print("[ERR]", e)
+
+if __name__ == "__main__":
     main()

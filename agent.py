@@ -189,6 +189,54 @@ def _db():
     return conn
 
 def _fetch_unseen(service):
+    """
+    Return list of tuples: (msg_id, thread_id, raw_bytes) for unread messages.
+    Tries progressively broader queries so we don't miss anything.
+    """
+    import base64
+
+    def _fetch_with(query=None, labelIds=None, limit=50):
+        params = {"userId": "me", "maxResults": limit}
+        if query is not None:
+            params["q"] = query
+        if labelIds is not None:
+            params["labelIds"] = labelIds
+
+        out = []
+        resp = service.users().messages().list(**params).execute()
+        for m in resp.get("messages", []):
+            msg_id = m["id"]
+            meta = service.users().messages().get(userId="me", id=msg_id, format="metadata").execute()
+            thread_id = meta.get("threadId")
+            raw_resp = service.users().messages().get(userId="me", id=msg_id, format="raw").execute()
+            raw_bytes = base64.urlsafe_b64decode(raw_resp["raw"])
+            out.append((msg_id, thread_id, raw_bytes))
+        return out
+
+    # Try 1: common case (unread in Inbox, any tab)
+    msgs = _fetch_with(query="is:unread", labelIds=["INBOX"])
+    if msgs:
+        print(f"[DEBUG] pass1 INBOX is:unread -> {len(msgs)}")
+        return msgs
+
+    # Try 2: super broad (any unread anywhere, no label filter)
+    msgs = _fetch_with(query="is:unread", labelIds=None)
+    if msgs:
+        print(f"[DEBUG] pass2 ANY is:unread -> {len(msgs)}")
+        return msgs
+
+    # Try 3: use UNREAD label directly (broadest)
+    msgs = _fetch_with(query=None, labelIds=["UNREAD"])
+    if msgs:
+        print(f"[DEBUG] pass3 label:UNREAD -> {len(msgs)}")
+        return msgs
+
+    print("[DEBUG] no unread messages found by any strategy")
+    return []
+
+'''
+Removed this as we are getting an error and our system is unable to read the messages
+def _fetch_unseen(service):
     """Return list of tuples: (msg_id, thread_id, raw_bytes) for unread INBOX messages."""
     out = []
     resp = service.users().messages().list(
@@ -209,7 +257,7 @@ def _fetch_unseen(service):
         # mark as read immediately (optional)
         service.users().messages().modify(userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}).execute()
     return out
-
+'''
 def handle(service, conn, raw, thread_id):
     msg = email.message_from_bytes(raw)
     mid = msg.get("Message-ID")

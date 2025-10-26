@@ -21,9 +21,8 @@ Files required:
   - client_secret.json (OAuth client credentials)
   - token.json (created automatically on first run)
 """
-
 from __future__ import print_function
-
+from llm_agent import summarize_thread, call_llm_extract, decide_action, received_local_dt
 import os, re, sqlite3, email, base64
 from email.message import EmailMessage
 from email.header import decode_header, make_header
@@ -32,6 +31,31 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+import json, pytz
+from datetime import datetime, timedelta
+from dateutil import parser as dateparser
+from dotenv import load_dotenv
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
+
+# ---- OpenAI client (new SDK) ----
+from openai import OpenAI
+_oai = OpenAI(api_key=OPENAI_API_KEY)
+
+# Utility: get local tz-aware datetime from RFC2822 email header
+def _received_dt(msg):
+    try:
+        hdr = msg.get("Date")
+        dt = email.utils.parsedate_to_datetime(hdr) if hdr else datetime.utcnow()
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        return dt.astimezone(pytz.timezone(TIMEZONE))
+    except Exception:
+        return datetime.now(pytz.timezone(TIMEZONE))
+
+
 
 # ----------------- Config -----------------
 RESTAURANT_NAME = os.getenv("RESTAURANT_NAME", "My Restaurant")
@@ -127,7 +151,7 @@ def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
     if thread_id:
         payload["threadId"] = thread_id
     return service.users().messages().send(userId="me", body=payload).execute()
-
+'''
 def _classify(text):
     t = text.lower()
     if any(re.search(p, t) for p in RESERVATION_KEYWORDS): return "reservation"
@@ -147,7 +171,7 @@ def _extract(text):
     if det["time"] and re.fullmatch(r"\d{1,2}", det["time"].strip()):
         det["time"] += ":00"
     return det
-
+'''
 def _tpl_confirm(name, d, t, p):
     L = [
         f"Hi{(' ' + name) if name else ''},",
@@ -187,6 +211,45 @@ def _db():
     c.execute("CREATE TABLE IF NOT EXISTS drafts(id INTEGER PRIMARY KEY, to_email TEXT, subject TEXT, body TEXT, in_reply_to TEXT, created_at TEXT, sent_at TEXT)")
     conn.commit()
     return conn
+def _get_thread_bundle(service, thread_id):
+    """
+    Return a condensed list of dicts for the last few messages in a thread:
+      {from, date, subject, body}
+    """
+    data = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    items = []
+    for part in data.get("messages", [])[-4:]:  # last 4 messages
+        payload = part.get("payload", {})
+        headers = payload.get("headers", [])
+        def hdr(name):
+            for h in headers:
+                if h.get("name","").lower() == name.lower():
+                    return h.get("value","")
+            return ""
+        frm = hdr("From") or ""
+        subj = hdr("Subject") or ""
+        date = hdr("Date") or ""
+        # Extract simple text/plain (fallback to text/html stripped)
+        body = ""
+        def walk(parts):
+            nonlocal body
+            for p in parts or []:
+                mime = p.get("mimeType","")
+                if "text/plain" in mime and p.get("body", {}).get("data"):
+                    import base64, quopri
+                    raw = base64.urlsafe_b64decode(p["body"]["data"])
+                    try:
+                        body = raw.decode("utf-8","replace")
+                    except:
+                        body = quopri.decodestring(raw).decode("utf-8","replace")
+                    return
+                if "parts" in p:
+                    walk(p["parts"])
+        walk(payload.get("parts"))
+        if not body:
+            body = "(no text body)"
+        items.append({"from": frm, "date": date, "subject": subj, "body": body})
+    return items
 
 def _fetch_unseen(service):
     """
@@ -268,39 +331,59 @@ def handle(service, conn, raw, thread_id):
     subj = _dec(msg.get("Subject", ""))
     body = _body(msg)
     from_email = email.utils.parseaddr(msg.get("From", ""))[1]
+    # Skip obvious automation
     if _is_no_reply(from_email, msg):
-        print("[SKIP no-reply] ->", from_email)
+        print("[SKIP no-reply/marketing] ->", from_email)
         return
-    name = email.utils.parseaddr(msg.get("From", ""))[0]
 
-    label = _classify(subj + " " + body)
+# Build thread context
+    thread_bundle = _get_thread_bundle(service, gmail_meta.get("threadId"))
+    thread_text = summarize_thread(thread_bundle)
 
-    if label == "reservation":
-        det = _extract(subj + " " + body)
-        hd, ht, hp = bool(det["date"]), bool(det["time"]), bool(det["party_size"])
-        if hd and ht and hp:
-            _send(service, from_email, f"Re: {subj} — Reservation Confirmed",
-                  _tpl_confirm(name, det["date"], det["time"], det["party_size"]),
-                  in_reply_to=mid, thread_id=thread_id)
-            print("[SENT] confirm ->", from_email)
-        else:
-            _send(service, from_email, f"Re: {subj} — One quick detail",
-                  _tpl_missing(name, hd, ht, hp),
-                  in_reply_to=mid, thread_id=thread_id)
-            print("[SENT] missing ->", from_email)
-    else:
-        dsubj = f"Re: {subj} — Thank you" if label == "review" else f"Re: {subj}"
-        dbody = _tpl_review(name) if label == "review" else _tpl_other(name)
+# Call LLM for structured extraction
+    extract = call_llm_extract(thread_text)
+
+# Use email's received time as reference for relative dates
+    ref_dt = received_local_dt(msg)
+
+    plan = decide_action(extract, ref_dt)
+
+    print(f"[LLM] plan={plan['action']} conf={plan['confidence']:.2f} "
+          f"date={plan['date_iso']} time={plan['time_24']} party={plan['party_size']}")
+
+    if plan["action"] == "confirm":
+        body_text = _tpl_confirm(
+            name,
+            plan["date_iso"],
+            plan["time_24"],
+            str(plan["party_size"])
+        )
+        _send(service, from_email, f"Re: {subj} — Reservation Confirmed",
+              body_text, in_reply_to=mid, thread_id=gmail_meta.get("threadId"))
+        print("[SENT] confirm ->", from_email)
+
+    elif plan["action"] == "ask_missing":
+        hd = bool(plan["date_iso"])
+        ht = bool(plan["time_24"])
+        hp = bool(plan["party_size"])
+        _send(service, from_email, f"Re: {subj} — One quick detail",
+              _tpl_missing(name, hd, ht, hp), in_reply_to=mid, thread_id=gmail_meta.get("threadId"))
+        print("[SENT] missing ->", from_email)
+
+    elif plan["action"] == "draft":
+        dsubj = f"Re: {subj} — Thank you"
+        dbody = _tpl_review(name)
         c.execute(
             "INSERT INTO drafts(to_email,subject,body,in_reply_to,created_at) VALUES (?,?,?,?,datetime('now'))",
             (from_email, dsubj, dbody, mid)
         )
         conn.commit()
-        print("[DRAFTED] ->", from_email)
+        print("[DRAFTED review] ->", from_email)
 
-    if mid:
-        c.execute("INSERT OR IGNORE INTO processed(message_id,processed_at) VALUES(?,datetime('now'))", (mid,))
-        conn.commit()
+    else:
+        print("[SKIP other] ->", from_email)
+    c.execute("INSERT OR REPLACE INTO processed(message_id, processed_at) VALUES (?, datetime('now'))", (mid,))
+    conn.commit()
 
 def send_pending(service, conn):
     c = conn.cursor()
@@ -324,7 +407,7 @@ def main():
     print(f"[INFO] fetched {len(messages)} unread messages")
 
 
-    for msg_id, thread_id, raw in _fetch_unseen(service):
+    for msg_id, thread_id, raw in messages:
         try:
             handle(service, conn, raw, thread_id)
         except Exception as e:

@@ -22,8 +22,11 @@ Files required:
   - token.json (created automatically on first run)
 """
 from __future__ import print_function
+import os 
+from dotenv import load_dotenv
+load_dotenv()
 from llm_agent import summarize_thread, call_llm_extract, decide_action, received_local_dt
-import os, re, sqlite3, email, base64
+import re, sqlite3, email, base64
 from email.message import EmailMessage
 from email.header import decode_header, make_header
 
@@ -34,8 +37,7 @@ from googleapiclient.discovery import build
 import json, pytz
 from datetime import datetime, timedelta
 from dateutil import parser as dateparser
-from dotenv import load_dotenv
-load_dotenv()
+
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TIMEZONE = os.getenv("TIMEZONE", "America/New_York")

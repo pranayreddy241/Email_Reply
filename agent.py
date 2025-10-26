@@ -272,6 +272,9 @@ def main():
     if "--send-pending" in sys.argv:
         send_pending(service, conn)
         return
+    messages = _fetch_unseen(service)  # list of (msg_id, thread_id, raw_bytes)
+    print(f"[INFO] fetched {len(messages)} unread messages")
+
 
     for msg_id, thread_id, raw in _fetch_unseen(service):
         try:

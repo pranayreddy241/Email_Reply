@@ -41,11 +41,20 @@ DB_PATH = os.getenv("AGENT_DB_PATH", "email_agent.sqlite")
 
 RESERVATION_KEYWORDS = [r"\breservation\b", r"\bbook(?:ing)?\b", r"\btable\b", r"\bparty\b"]
 REVIEW_KEYWORDS = [r"\breview\b", r"\bfeedback\b", r"\bcomplaint\b", r"\bpraise\b", r"\bexperience\b"]
-DATE_RE = r"(?:(?:on\s*)?(?P<date>(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?))"
-TIME_RE = r"(?:(?:at\s*)?(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|\b)))"
-PARTY_RE = r"(?:(?:for|party of)\s*(?P<party>\d{1,2}))"
+DATE_RE = r"(?:(?P<date>(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?|today|tomorrow|mon|tue|wed|thu|fri|sat|sun))"
+TIME_RE = r"(?:(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|\bo'clock\b)?))"
+PARTY_RE = r"(?:(?:for|party of|group of|we are|we're|total of)\s*(?P<party>\d{1,2}))"
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+def _is_no_reply(addr, msg):
+    a = (addr or "").lower()
+    if any(x in a for x in ["no-reply", "noreply", "notifications", "mailer-daemon"]):
+        return True
+    if msg.get("List-Unsubscribe"):
+        return True
+    return False
+
 
 # ----------------- Gmail API auth -----------------
 def get_gmail_service():
@@ -126,7 +135,7 @@ def _classify(text):
     return "other"
 
 def _extract(text):
-    d = re.search(DATE_RE, text, flags=re.I)
+    d = re.search(DATE,_RE text, flags=re.I)
     t = re.search(TIME_RE, text, flags=re.I)
     p = re.search(PARTY_RE, text, flags=re.I)
     det = {
@@ -182,7 +191,13 @@ def _db():
 def _fetch_unseen(service):
     """Return list of tuples: (msg_id, thread_id, raw_bytes) for unread INBOX messages."""
     out = []
-    resp = service.users().messages().list(userId="me", labelIds=["INBOX"], q="is:unread", maxResults=50).execute()
+    resp = service.users().messages().list(
+        userId="me",
+        labelIds=["INBOX"],
+        q="is:unread category:primary -from:(no-reply noreply notifications mailer-daemon)",
+        maxResults=50
+    ).execute()
+
     for m in resp.get("messages", []):
         msg_id = m["id"]
         # get threadId for proper threading
@@ -205,6 +220,9 @@ def handle(service, conn, raw, thread_id):
     subj = _dec(msg.get("Subject", ""))
     body = _body(msg)
     from_email = email.utils.parseaddr(msg.get("From", ""))[1]
+    if _is_no_reply(from_email, msg):
+        print("[SKIP no-reply] ->", from_email)
+        return
     name = email.utils.parseaddr(msg.get("From", ""))[0]
 
     label = _classify(subj + " " + body)

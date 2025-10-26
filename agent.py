@@ -135,7 +135,7 @@ def _classify(text):
     return "other"
 
 def _extract(text):
-    d = re.search(DATE,_RE text, flags=re.I)
+    d = re.search(DATE_RE, text, flags=re.I)
     t = re.search(TIME_RE, text, flags=re.I)
     p = re.search(PARTY_RE, text, flags=re.I)
     det = {

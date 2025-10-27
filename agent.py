@@ -322,7 +322,7 @@ def _fetch_unseen(service):
         # mark as read immediately (optional)
         service.users().messages().modify(userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}).execute()
     return out
-'''
+
 def handle(service, conn, raw, thread_id):
     msg = email.message_from_bytes(raw)
     mid = msg.get("Message-ID")
@@ -337,6 +337,67 @@ def handle(service, conn, raw, thread_id):
     if _is_no_reply(from_email, msg):
         print("[SKIP no-reply/marketing] ->", from_email)
         return
+'''
+def handle(service, conn, raw, thread_id):
+    msg = email.message_from_bytes(raw)
+    mid = msg.get("Message-ID")
+    c = conn.cursor()
+    if mid and c.execute("SELECT 1 FROM processed WHERE message_id=?", (mid,)).fetchone():
+        return
+
+    subj = _dec(msg.get("Subject", ""))
+    body = _body(msg)
+    from_email = email.utils.parseaddr(msg.get("From", ""))[1]
+
+    # Skip obvious automation
+    if _is_no_reply(from_email, msg):
+        print("[SKIP no-reply/marketing] ->", from_email)
+        return
+
+    # Build thread context (use thread_id, not gmail_meta)
+    thread_bundle = _get_thread_bundle(service, thread_id)
+    thread_text = summarize_thread(thread_bundle)
+
+    # LLM extraction + decision
+    extract = call_llm_extract(thread_text)
+    ref_dt = received_local_dt(msg)
+    plan = decide_action(extract, ref_dt)
+
+    print(f"[LLM] plan={plan['action']} conf={plan['confidence']:.2f} "
+          f"date={plan['date_iso']} time={plan['time_24']} party={plan['party_size']}")
+
+    name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
+
+    if plan["action"] == "confirm":
+        body_text = _tpl_confirm(name, plan["date_iso"], plan["time_24"], str(plan["party_size"]))
+        _send(service, from_email, f"Re: {subj} — Reservation Confirmed",
+              body_text, in_reply_to=mid, thread_id=thread_id)
+        print("[SENT] confirm ->", from_email)
+
+    elif plan["action"] == "ask_missing":
+        hd = bool(plan["date_iso"])
+        ht = bool(plan["time_24"])
+        hp = bool(plan["party_size"])
+        _send(service, from_email, f"Re: {subj} — One quick detail",
+              _tpl_missing(name, hd, ht, hp), in_reply_to=mid, thread_id=thread_id)
+        print("[SENT] missing ->", from_email)
+
+    elif plan["action"] == "draft":
+        dsubj = f"Re: {subj} — Thank you"
+        dbody = _tpl_review(name)
+        c.execute(
+            "INSERT INTO drafts(to_email,subject,body,in_reply_to,created_at) VALUES (?,?,?,?,datetime('now'))",
+            (from_email, dsubj, dbody, mid)
+        )
+        conn.commit()
+        print("[DRAFTED review] ->", from_email)
+    else:
+        print("[SKIP other] ->", from_email)
+
+    # mark as processed
+    if mid:
+        c.execute("INSERT OR REPLACE INTO processed(message_id, processed_at) VALUES (?, datetime('now'))", (mid,))
+        conn.commit()
 
 # Build thread context
     thread_bundle = _get_thread_bundle(service, gmail_meta.get("threadId"))
@@ -386,7 +447,7 @@ def handle(service, conn, raw, thread_id):
         print("[SKIP other] ->", from_email)
     c.execute("INSERT OR REPLACE INTO processed(message_id, processed_at) VALUES (?, datetime('now'))", (mid,))
     conn.commit()
-
+'''
 def send_pending(service, conn):
     c = conn.cursor()
     for did, to_email, subject, body, in_reply_to in c.execute(
@@ -396,7 +457,7 @@ def send_pending(service, conn):
         c.execute("UPDATE drafts SET sent_at=datetime('now') WHERE id=?", (did,))
         conn.commit()
         print("[SENT draft]", did)
-
+'''
 def main():
     service = get_gmail_service()
     conn = _db()

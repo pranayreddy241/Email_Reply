@@ -29,6 +29,8 @@ from llm_agent import summarize_thread, call_llm_extract, decide_action, receive
 import re, sqlite3, email, base64
 from email.message import EmailMessage
 from email.header import decode_header, make_header
+import time, random
+from googleapiclient.errors import HttpError
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -153,6 +155,30 @@ def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
     if thread_id:
         payload["threadId"] = thread_id
     return service.users().messages().send(userId="me", body=payload).execute()
+
+def _execute_with_retries(req, retries=5, base=1.0, cap=30.0, what="request"):
+    for attempt in range(retries):
+        try:
+            return req.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            # Retry on transient server/network errors
+            if status in (500, 502, 503, 504):
+                delay = min(cap, base * (2 ** attempt) + random.random())
+                print(f"[RETRY] {what} failed with {status}, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
+                time.sleep(delay)
+                continue
+            # non-retryable
+            raise
+        except Exception as e:
+            # network hiccup etc — retry
+            delay = min(cap, base * (2 ** attempt) + random.random())
+            print(f"[RETRY] {what} exception {e!r}, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
+            time.sleep(delay)
+            continue
+    # exhausted
+    raise RuntimeError(f"{what} failed after {retries} retries")
+
 '''
 def _classify(text):
     t = text.lower()
@@ -252,6 +278,68 @@ def _get_thread_bundle(service, thread_id):
             body = "(no text body)"
         items.append({"from": frm, "date": date, "subject": subj, "body": body})
     return items
+def _fetch_unseen(service):
+    """
+    Return list of tuples: (msg_id, thread_id, raw_bytes) for unread messages.
+    - Robust against backend 500s with retries
+    - Uses threadId directly from list() to avoid extra metadata call
+    """
+    import base64
+
+    def _pull(query=None, labelIds=None, limit=50):
+        params = {"userId": "me", "maxResults": limit}
+        if query is not None:
+            params["q"] = query
+        if labelIds is not None:
+            params["labelIds"] = labelIds
+
+        out, skipped = [], []
+        # list messages (this already returns id + threadId)
+        resp = _execute_with_retries(
+            service.users().messages().list(**params),
+            what="messages.list"
+        )
+        for m in resp.get("messages", []):
+            msg_id = m["id"]
+            thread_id = m.get("threadId")  # present in list() result
+
+            # fetch raw with retries
+            try:
+                raw_resp = _execute_with_retries(
+                    service.users().messages().get(userId="me", id=msg_id, format="raw"),
+                    what=f"messages.get(raw,{msg_id})"
+                )
+                raw_bytes = base64.urlsafe_b64decode(raw_resp["raw"])
+                out.append((msg_id, thread_id, raw_bytes))
+            except Exception as e:
+                print(f"[SKIP message] id={msg_id} reason={e}")
+                skipped.append(msg_id)
+                continue
+        if skipped:
+            print(f"[INFO] skipped {len(skipped)} message(s) due to transient errors: {skipped[:3]}{'...' if len(skipped)>3 else ''}")
+        return out
+
+    # Pass 1: normal case – unread in INBOX
+    msgs = _pull(query=os.getenv("GMAIL_QUERY", "is:unread"), labelIds=["INBOX"], limit=int(os.getenv("MAX_PROCESS","10")))
+    if msgs:
+        print(f"[DEBUG] pass1 INBOX is:unread -> {len(msgs)}")
+        return msgs
+
+    # Pass 2: unread anywhere
+    msgs = _pull(query="is:unread", labelIds=None, limit=int(os.getenv("MAX_PROCESS","10")))
+    if msgs:
+        print(f"[DEBUG] pass2 ANY is:unread -> {len(msgs)}")
+        return msgs
+
+    # Pass 3: fallback to label UNREAD
+    msgs = _pull(query=None, labelIds=["UNREAD"], limit=int(os.getenv("MAX_PROCESS","10")))
+    if msgs:
+        print(f"[DEBUG] pass3 label:UNREAD -> {len(msgs)}")
+        return msgs
+
+    print("[DEBUG] no unread messages found by any strategy")
+    return []
+'''
 
 def _fetch_unseen(service):
     """
@@ -298,7 +386,7 @@ def _fetch_unseen(service):
 
     print("[DEBUG] no unread messages found by any strategy")
     return []
-
+'''
 '''
 Removed this as we are getting an error and our system is unable to read the messages
 def _fetch_unseen(service):

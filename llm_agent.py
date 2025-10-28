@@ -1,4 +1,4 @@
-# llm_agent.py
+'''# llm_agent.py
 import os, json, email, pytz
 from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
@@ -164,4 +164,22 @@ def decide_action(extract: Dict[str,Any], ref_dt: datetime) -> Dict[str,Any]:
         "time_24": time_24,
         "notes": notes,
         "action": action,
-    }
+    }'''
+from llama_cpp import Llama
+
+LLM_BACKEND = os.getenv("LLM_BACKEND", "llama_cpp")
+MODEL_PATH  = os.getenv("LLM_MODEL_PATH", "models/llama2-7b-chat.bin")
+
+if LLM_BACKEND == "llama_cpp":
+    llm = Llama(model_path=MODEL_PATH, n_threads=4)
+    
+def call_llm_extract(thread_text: str) -> dict | None:
+    resp = llm.completion(
+        prompt=f"{SYSTEM}\nUser: {thread_text}\nAssistant:",
+        max_tokens=256,
+        stop=None,
+        echo=False
+    )
+    raw = resp['choices'][0]['text'].strip()
+    return json.loads(raw)
+

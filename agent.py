@@ -45,8 +45,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
 
 # ---- OpenAI client (new SDK) ----
-from openai import OpenAI
-_oai = OpenAI(api_key=OPENAI_API_KEY)
+#from openai import OpenAI
+#_oai = OpenAI(api_key=OPENAI_API_KEY)
 
 # Utility: get local tz-aware datetime from RFC2822 email header
 def _received_dt(msg):

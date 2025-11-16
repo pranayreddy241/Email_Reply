@@ -28,7 +28,7 @@ import re
 import sqlite3
 import email
 import base64
-import time
+import time, string
 import random
 import json
 from datetime import datetime, timedelta
@@ -192,6 +192,176 @@ def _tpl_confirm(name, d, t, p):
     L += ["", "We look forward to hosting you!", f"— {RESTAURANT_NAME}"]
     return "\n".join(L)
 
+# ---- Feedback helpers (sentiment + coupons) ----
+
+def analyze_sentiment_with_backoff(message_text: str):
+    """
+    Returns (sentiment:str, score:int [1..5]).
+    sentiment in {'positive','neutral','negative'}; score 1=very happy .. 5=furious.
+    Uses OpenAI with retry, then a simple heuristic fallback.
+    """
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    if client and os.getenv("OPENAI_API_KEY"):
+        for attempt in range(4):
+            try:
+                prompt = (
+                    "Rate the customer's tone.\n"
+                    "Return strict JSON: {\"sentiment\":\"positive|neutral|negative\",\"score\":1-5}.\n"
+                    "Guidelines: 1 very happy, 3 neutral, 5 extremely upset.\n\n"
+                    f"Message:\n{message_text}"
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=60
+                )
+                txt = resp.choices[0].message.content.strip()
+                import json
+                obj = json.loads(txt)
+                s = str(obj.get("sentiment", "neutral")).lower()
+                sc = int(obj.get("score", 3))
+                sc = max(1, min(5, sc))
+                if s not in {"positive", "neutral", "negative"}:
+                    s = "neutral"
+                return s, sc
+            except Exception as e:
+                wait = 2 ** attempt
+                print(f"[WARN] OpenAI sentiment attempt {attempt+1} failed: {e} (retry {wait}s)")
+                time.sleep(wait)
+
+    # Heuristic fallback if OpenAI fails or quota issue
+    t = message_text.lower()
+    neg_hits = sum(w in t for w in [
+        "awful", "terrible", "horrible", "disgusting", "cold", "late",
+        "rude", "bad", "worst", "never again", "refund", "angry", "disappointed"
+    ])
+    pos_hits = sum(w in t for w in [
+        "amazing", "great", "excellent", "love", "loved", "fantastic",
+        "wonderful", "perfect", "delicious", "best"
+    ])
+
+    if neg_hits >= 3: return "negative", 5
+    if neg_hits == 2: return "negative", 4
+    if neg_hits == 1: return "negative", 3
+    if pos_hits >= 2: return "positive", 1
+    if pos_hits == 1: return "positive", 2
+    return "neutral", 3
+
+
+def choose_discount(sentiment: str, score: int, message_text: str) -> int:
+    """
+    Map sentiment + upset score -> discount between 5% and 40%.
+    """
+    text = message_text.lower()
+
+    if sentiment == "positive":
+        enthusiastic = any(w in text for w in [
+            "love", "loved", "amazing", "incredible", "fantastic", "perfect", "best"
+        ])
+        return 10 if enthusiastic else 5
+
+    if sentiment == "neutral":
+        return 15
+
+    # negative
+    mapping = {3: 15, 4: 25, 5: 30}
+    disc = mapping.get(score, 15)
+
+    if score == 5 and any(w in text for w in [
+        "worst", "never again", "refund", "disgusting", "unacceptable", "furious"
+    ]):
+        disc = 40
+
+    return min(disc, 40)
+
+
+def _random_code(prefix: str, pct: int) -> str:
+    tail = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    return f"{prefix}{pct}-{tail}"
+
+
+def persist_coupon(conn, email_addr: str, code: str, discount: int, sentiment: str, score: int):
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO coupons(email, code, discount, sentiment, score) VALUES (?,?,?,?,?)",
+        (email_addr, code, discount, sentiment, score)
+    )
+    conn.commit()
+
+
+def generate_personalized_reply(name: str, sentiment: str, score: int,
+                                discount: int, code: str, message_text: str) -> str:
+    """
+    Use GPT to craft a short, kind, personalized reply (80–120 words).
+    Falls back to compact templates if OpenAI unavailable.
+    """
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    if client and os.getenv("OPENAI_API_KEY"):
+        for attempt in range(4):
+            try:
+                sys = (
+                    "You are a warm, concise customer service writer for a restaurant. "
+                    "Write a SHORT, sincere, human reply (80–120 words). "
+                    "Personalize tone to the customer's sentiment and upset score. "
+                    "Always include the exact coupon code and % once. "
+                    "Avoid generic boilerplates; vary the phrasing. "
+                    "Sign off with the restaurant name only."
+                )
+                user = (
+                    f"Restaurant: {RESTAURANT_NAME}\n"
+                    f"Customer name: {name or 'Guest'}\n"
+                    f"Sentiment: {sentiment}\n"
+                    f"Upset score (1 very happy .. 5 furious): {score}\n"
+                    f"Discount: {discount}%\n"
+                    f"Coupon code: {code}\n"
+                    f"Customer message:\n{message_text}\n"
+                    "Write the reply body only."
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    temperature=0.7,
+                    messages=[
+                        {"role": "system", "content": sys},
+                        {"role": "user", "content": user},
+                    ],
+                    max_tokens=240,
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                wait = 2 ** attempt
+                print(f"[WARN] OpenAI reply attempt {attempt+1} failed: {e} (retry {wait}s)")
+                time.sleep(wait)
+
+    # Fallback templates if GPT fails
+    if sentiment == "positive":
+        return (
+            f"Hi{(' ' + name) if name else ''},\n\n"
+            f"Thank you for the wonderful note—guests like you make our day. "
+            f"As a small thank-you, here’s {discount}% off next time (code: {code}). "
+            f"We can’t wait to welcome you back.\n\n— {RESTAURANT_NAME}"
+        )
+    if sentiment == "neutral":
+        return (
+            f"Hi{(' ' + name) if name else ''},\n\n"
+            f"Thanks for sharing your thoughts—your feedback helps us improve. "
+            f"Please accept {discount}% off your next visit (code: {code}); "
+            f"we’d love another chance to impress.\n\n— {RESTAURANT_NAME}"
+        )
+
+    opener = "We’re truly sorry" if score >= 4 else "We’re sorry"
+    return (
+        f"Hi{(' ' + name) if name else ''},\n\n"
+        f"{opener} that your experience fell short. You matter to us, and we’ve noted your concerns with the team. "
+        f"Please allow us to make it right—here’s {discount}% off for your next visit (code: {code}). "
+        f"We appreciate the chance to earn back your trust.\n\n— {RESTAURANT_NAME}"
+    )
 
 def _tpl_missing(name, hd, ht, hp):
     miss = [x for x, v in {"date": hd, "time": ht, "party size": hp}.items() if not v]
@@ -225,23 +395,33 @@ def _tpl_other(name):
 def _db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS processed("
-        "  message_id TEXT PRIMARY KEY,"
-        "  processed_at TEXT)"
-    )
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS drafts("
-        "  id INTEGER PRIMARY KEY,"
-        "  to_email TEXT,"
-        "  subject TEXT,"
-        "  body TEXT,"
-        "  in_reply_to TEXT,"
-        "  created_at TEXT,"
-        "  sent_at TEXT)"
-    )
+    c.execute("CREATE TABLE IF NOT EXISTS processed(message_id TEXT PRIMARY KEY, processed_at TEXT)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS drafts(
+            id INTEGER PRIMARY KEY,
+            to_email TEXT,
+            subject TEXT,
+            body TEXT,
+            in_reply_to TEXT,
+            created_at TEXT,
+            sent_at TEXT
+        )
+    """)
+    # New: coupons ledger
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS coupons(
+            id INTEGER PRIMARY KEY,
+            email TEXT,
+            code TEXT UNIQUE,
+            discount INTEGER,
+            sentiment TEXT,
+            score INTEGER,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     conn.commit()
     return conn
+
 
 
 def _get_thread_bundle(service, thread_id):

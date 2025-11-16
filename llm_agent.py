@@ -151,7 +151,7 @@ def decide_action(extract: Dict[str,Any], ref_dt: datetime) -> Dict[str,Any]:
         else:
             action = "ask_missing"
     elif intent == "review":
-        action = "draft"
+        action = "feedback"
     else:
         action = "skip"
 

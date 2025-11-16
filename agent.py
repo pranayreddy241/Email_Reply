@@ -427,24 +427,24 @@ def handle(service, conn, raw, thread_id):
 
     elif plan["action"] == "feedback":
     # FULL AUTO FEEDBACK SYSTEM
-    sentiment, score = analyze_sentiment_with_backoff(body)
-    discount = choose_discount(sentiment, score, body)
+        sentiment, score = analyze_sentiment_with_backoff(body)
+        discount = choose_discount(sentiment, score, body)
 
-    prefix = "CARE" if sentiment == "negative" else "THANKS"
-    code = _random_code(prefix, discount)
-    persist_coupon(conn, from_email, code, discount, sentiment, score)
+        prefix = "CARE" if sentiment == "negative" else "THANKS"
+        code = _random_code(prefix, discount)
+        persist_coupon(conn, from_email, code, discount, sentiment, score)
 
-    reply_body = generate_personalized_reply(
-        name,
-        sentiment,
-        score,
-        discount,
-        code,
-        body
-    )
+        reply_body = generate_personalized_reply(
+            name,
+            sentiment,
+            score,
+            discount,
+            code,
+            body
+        )
 
-    _send(service, from_email, f"Re: {subj}", reply_body, in_reply_to=mid, thread_id=thread_id)
-    print(f"[SENT feedback] {sentiment}/{score} -> {discount}% code={code} to {from_email}")
+        _send(service, from_email, f"Re: {subj}", reply_body, in_reply_to=mid, thread_id=thread_id)
+        print(f"[SENT feedback] {sentiment}/{score} -> {discount}% code={code} to {from_email}")
 
 
     else:

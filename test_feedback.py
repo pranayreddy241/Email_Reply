@@ -3,7 +3,7 @@ test_feedback.py — run local simulations of feedback to validate sentiment,
 discount logic, GPT fallbacks, and reply generation.
 """
 
-from agent import (
+from agent_plus import (
     analyze_sentiment_with_backoff,
     choose_discount,
     generate_personalized_reply,

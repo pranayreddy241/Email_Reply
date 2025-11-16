@@ -532,7 +532,7 @@ def _fetch_unseen(service):
     print("[DEBUG] no unread messages found by any strategy")
     return []
 
-
+'''
 def handle(service, conn, raw, thread_id):
     """
     Process a single unread Gmail message given its raw bytes + thread_id.
@@ -637,6 +637,136 @@ def handle(service, conn, raw, thread_id):
             "VALUES (?, datetime('now'))",
             (mid,),
         )
+        conn.commit()
+'''
+def handle(service, conn, raw, thread_id):
+    """
+    Process a single unread Gmail message given its raw bytes + thread_id.
+    Uses llm_agent to decide what to do.
+    """
+    msg = email.message_from_bytes(raw)
+    mid = msg.get("Message-ID")
+    c = conn.cursor()
+
+    # Skip processed ONLY for reservation/other, NOT feedback
+    if mid:
+        seen = c.execute("SELECT action FROM processed WHERE message_id=?", (mid,)).fetchone()
+        if seen:
+            if seen[0] != "feedback":   # feedback is allowed to re-run
+                return
+
+    subj = _dec(msg.get("Subject", ""))
+    body = _body(msg)
+    from_email = email.utils.parseaddr(msg.get("From", ""))[1]
+
+    # skip marketing / no-reply
+    if _is_no_reply(from_email, msg):
+        print("[SKIP no-reply/marketing] ->", from_email)
+        return
+
+    # Build thread context
+    thread_bundle = _get_thread_bundle(service, thread_id)
+    thread_text = summarize_thread(thread_bundle)
+
+    # LLM Structured extraction
+    extract = call_llm_extract(thread_text)
+    ref_dt = received_local_dt(msg)
+    plan = decide_action(extract, ref_dt)
+
+    print(
+        f"[LLM] plan={plan['action']} conf={plan['confidence']:.2f} "
+        f"date={plan['date_iso']} time={plan['time_24']} party={plan['party_size']}"
+    )
+
+    name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
+
+
+    # ===============================
+    # 1) RESERVATION CONFIRM
+    # ===============================
+    if plan["action"] == "confirm":
+        body_text = _tpl_confirm(name, plan["date_iso"], plan["time_24"], str(plan["party_size"]))
+        _send(service, from_email, f"Re: {subj} — Reservation Confirmed",
+              body_text, in_reply_to=mid, thread_id=thread_id)
+        print("[SENT] confirm ->", from_email)
+
+        # mark processed
+        if mid:
+            c.execute("INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                      (mid, "confirm"))
+            conn.commit()
+        return
+
+
+    # ===============================
+    # 2) RESERVATION - ASK MISSING INFO
+    # ===============================
+    if plan["action"] == "ask_missing":
+        hd = bool(plan["date_iso"])
+        ht = bool(plan["time_24"])
+        hp = bool(plan["party_size"])
+
+        _send(
+            service,
+            from_email,
+            f"Re: {subj} — One quick detail",
+            _tpl_missing(name, hd, ht, hp),
+            in_reply_to=mid,
+            thread_id=thread_id,
+        )
+        print("[SENT] missing ->", from_email)
+
+        # mark processed
+        if mid:
+            c.execute("INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                      (mid, "ask_missing"))
+            conn.commit()
+        return
+
+
+    # ===============================
+    # 3) FEEDBACK → FULL AUTO REPLY
+    # ===============================
+    if plan["action"] == "feedback":
+        print("[INFO] Feedback detected → Sending coupon reply")
+
+        # sentiment + score
+        sentiment, score = analyze_sentiment_with_backoff(body)
+
+        # discount %
+        discount = choose_discount(sentiment, score, body)
+
+        # coupon code
+        prefix = "CARE" if sentiment == "negative" else "THANKS"
+        code = _random_code(prefix, discount)
+        persist_coupon(conn, from_email, code, discount, sentiment, score)
+
+        # generate LLM reply
+        reply_body = generate_personalized_reply(
+            name,
+            sentiment,
+            score,
+            discount,
+            code,
+            body
+        )
+
+        # send email
+        _send(service, from_email, f"Re: {subj}", reply_body, in_reply_to=mid, thread_id=thread_id)
+        print(f"[SENT feedback] {sentiment}/{score} -> {discount}% code={code} to {from_email}")
+
+        # DO NOT mark processed
+        return
+
+
+    # ===============================
+    # 4) OTHER → SKIP
+    # ===============================
+    print("[SKIP other] ->", from_email)
+
+    if mid:
+        c.execute("INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                  (mid, "skip"))
         conn.commit()
 
 

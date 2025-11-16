@@ -395,7 +395,22 @@ def _tpl_other(name):
 def _db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS processed(message_id TEXT PRIMARY KEY, processed_at TEXT)")
+
+    # Base table (old deployments might already have this without `action`)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS processed(
+            message_id TEXT PRIMARY KEY,
+            processed_at TEXT
+        )
+    """)
+
+    # 🔧 Ensure `action` column exists (migrate old DBs safely)
+    c.execute("PRAGMA table_info(processed)")
+    cols = [row[1] for row in c.fetchall()]  # row[1] is column name
+    if "action" not in cols:
+        c.execute("ALTER TABLE processed ADD COLUMN action TEXT")
+
+    # drafts table
     c.execute("""
         CREATE TABLE IF NOT EXISTS drafts(
             id INTEGER PRIMARY KEY,
@@ -407,7 +422,8 @@ def _db():
             sent_at TEXT
         )
     """)
-    # New: coupons ledger
+
+    # coupons table
     c.execute("""
         CREATE TABLE IF NOT EXISTS coupons(
             id INTEGER PRIMARY KEY,
@@ -419,9 +435,9 @@ def _db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+
     conn.commit()
     return conn
-
 
 
 def _get_thread_bundle(service, thread_id):

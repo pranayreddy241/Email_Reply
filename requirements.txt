@@ -1,4 +1,4 @@
-# === Core Python dependencies ===
+# === Core dependencies ===
 python-dotenv==1.0.1
 pytz==2025.1
 python-dateutil==2.9.0.post0
@@ -17,6 +17,9 @@ oauthlib==3.3.1
 # === OpenAI SDK (LLM agent backend) ===
 openai==1.51.0
 
+# === Web framework ===
+streamlit==1.40.2
+
 # === Utility dependencies ===
 protobuf==6.33.0
 pyasn1==0.6.1
@@ -30,8 +33,3 @@ certifi==2025.7.15
 charset-normalizer==3.3.2
 uritemplate==4.2.0
 proto-plus==1.26.1
-
-# === Local LLM Agent modules ===
-email
-sqlite3
-re

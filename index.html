@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AI Restaurant Email Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --primary: #ff6b35;
+    --bg: #f7f7fb;
+    --card-bg: #ffffff;
+    --text-main: #222222;
+    --text-muted: #666666;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: linear-gradient(135deg, #fff2e9, #f7f7fb);
+    color: var(--text-main);
+  }
+  .wrapper {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 32px 16px 64px;
+  }
+  header {
+    text-align: center;
+    margin-bottom: 32px;
+  }
+  h1 {
+    font-size: 2.3rem;
+    margin-bottom: 8px;
+  }
+  .tagline {
+    color: var(--text-muted);
+    font-size: 0.98rem;
+  }
+  .badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(255,107,53,0.08);
+    color: var(--primary);
+    font-weight: 600;
+    font-size: 0.8rem;
+    margin-bottom: 10px;
+  }
+  .card {
+    background: var(--card-bg);
+    border-radius: 18px;
+    padding: 18px 20px;
+    margin-bottom: 18px;
+    box-shadow: 0 10px 32px rgba(15, 15, 50, 0.06);
+  }
+  h2 {
+    font-size: 1.2rem;
+    margin-top: 0;
+  }
+  ul {
+    padding-left: 18px;
+    margin: 10px 0;
+  }
+  li {
+    margin-bottom: 6px;
+    color: var(--text-muted);
+  }
+  code {
+    background: #f2f2f8;
+    padding: 2px 5px;
+    border-radius: 4px;
+    font-size: 0.9rem;
+  }
+  pre {
+    background: #111119;
+    color: #f8f8ff;
+    padding: 12px 14px;
+    border-radius: 12px;
+    font-size: 0.85rem;
+    overflow-x: auto;
+  }
+  .pill {
+    display: inline-block;
+    background: #f2f2f8;
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 0.8rem;
+    margin: 2px 4px 2px 0;
+  }
+  .footer {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    margin-top: 30px;
+  }
+  .highlight {
+    background: #fff5ec;
+    border-left: 4px solid var(--primary);
+    padding: 8px 10px;
+    border-radius: 12px;
+    font-size: 0.88rem;
+  }
+</style>
+</head>
+<body>
+<div class="wrapper">
+
+  <header>
+    <div class="badge">AI-powered email assistant for restaurants</div>
+    <h1>🍽️ AI Restaurant Email Agent</h1>
+    <p class="tagline">
+      Automatically reply to reservations, respond thoughtfully to feedback, and send smart coupons – directly from your Gmail inbox.
+    </p>
+  </header>
+
+  <div class="card">
+    <h2>✨ What it does</h2>
+    <ul>
+      <li>Reads your <b>Gmail inbox</b> using the Gmail API (OAuth, no password sharing).</li>
+      <li>Understands whether an email is about a <b>reservation</b>, <b>feedback</b>, or <b>something else</b>.</li>
+      <li>Auto-confirms reservations or asks politely for missing details.</li>
+      <li>Analyzes feedback tone (happy / neutral / upset) using OpenAI.</li>
+      <li>Sends <b>personalized replies</b> with unique coupon codes (5–40% off) to win guests back.</li>
+      <li>Stores all coupons in a local SQLite database for later tracking.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>🧩 Requirements</h2>
+    <ul>
+      <li>Python <b>3.10+</b></li>
+      <li>An <b>OpenAI API key</b> (e.g. <code>sk-...</code>)</li>
+      <li>A Gmail account for your restaurant (e.g. <code>yourrestaurant@gmail.com</code>)</li>
+      <li>A <b>Google Cloud project</b> with the Gmail API enabled + <code>client_secret.json</code></li>
+      <li>Basic terminal / command line access</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>🛠️ Setup (quick version)</h2>
+    <ol>
+      <li>Clone the GitHub repo:
+        <pre>git clone https://github.com/pranayreddy241/Email_Reply.git
+cd Email_Reply</pre>
+      </li>
+      <li>Create a <code>.env</code> file:
+        <pre>
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+TIMEZONE=America/New_York
+
+EMAIL_ADDRESS=your@gmail.com
+EMAIL_PASSWORD=your-app-password
+
+RESTAURANT_NAME="Rain's Restaurant"
+RESERVATION_PHONE="+1-555-123-4567"
+RESERVATION_LINK="https://yourbookinglink.com"
+AGENT_DB_PATH=email_agent.sqlite
+
+USE_GMAIL_DRAFTS=false
+        </pre>
+      </li>
+      <li>Download <code>client_secret.json</code> from Google Cloud and place it in the project root.</li>
+      <li>Run the installer:
+        <pre>./install.sh</pre>
+      </li>
+      <li>Start the agent:
+        <pre>source venv/bin/activate
+python3 agent.py</pre>
+      </li>
+      <li>Start the coupon dashboard:
+        <pre>streamlit run dashboard.py</pre>
+      </li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>🎟️ Coupons & Sentiment</h2>
+    <p>The agent stores each feedback reply as a row in a local SQLite table <code>coupons</code>:</p>
+    <ul>
+      <li><span class="pill">email</span> guest email</li>
+      <li><span class="pill">code</span> coupon code like <code>CARE30-AB12X</code></li>
+      <li><span class="pill">discount</span> % off (5–40)</li>
+      <li><span class="pill">sentiment</span> positive / neutral / negative</li>
+      <li><span class="pill">score</span> upset score (1–5)</li>
+      <li><span class="pill">created_at</span> timestamp</li>
+    </ul>
+    <p class="highlight">
+      You can open the <code>email_agent.sqlite</code> in any SQLite viewer, or use the built-in
+      <code>view_coupons.py</code> or the Streamlit dashboard to explore and export your data.
+    </p>
+  </div>
+
+  <div class="footer">
+    Built with ❤️ using Python. 
+  </div>
+</div>
+</body>
+</html>

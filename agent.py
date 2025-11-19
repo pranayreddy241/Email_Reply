@@ -549,7 +549,7 @@ def _fetch_unseen(service):
     return []
 
 '''
-def handle(service, conn, raw, thread_id):
+def handle(service, conn, raw, thread_id, msg_id):
     """
     Process a single unread Gmail message given its raw bytes + thread_id.
     Uses llm_agent to decide what to do (confirm / ask_missing / draft / skip).
@@ -655,7 +655,7 @@ def handle(service, conn, raw, thread_id):
         )
         conn.commit()
 '''
-def handle(service, conn, raw, thread_id):
+def handle(service, conn, raw, thread_id, msg_id):
     """
     Process a single unread Gmail message given its raw bytes + thread_id.
     Uses llm_agent to decide what to do.
@@ -711,6 +711,16 @@ def handle(service, conn, raw, thread_id):
             c.execute("INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
                       (mid, "confirm"))
             conn.commit()
+            # also mark the Gmail message as READ so we don't see it again as "unread"
+        try:
+            service.users().messages().modify(
+                userId="me",
+                id=msg_id,
+                body={"removeLabelIds": ["UNREAD"]}
+            ).execute()
+        except Exception as e:
+            print("[WARN] failed to mark as read:", e)
+
         return
 
 
@@ -817,7 +827,7 @@ def main():
 
     for msg_id, thread_id, raw in messages:
         try:
-            handle(service, conn, raw, thread_id)
+            handle(service, conn, raw, thread_id, msg_id)
         except Exception as e:
             print("[ERR]", e)
 

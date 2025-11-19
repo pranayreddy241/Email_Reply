@@ -396,6 +396,41 @@ def _db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
+    c.execute("CREATE TABLE IF NOT EXISTS processed(message_id TEXT PRIMARY KEY, processed_at TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS drafts(
+        id INTEGER PRIMARY KEY,
+        to_email TEXT, subject TEXT, body TEXT, in_reply_to TEXT, created_at TEXT, sent_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS coupons(
+        id INTEGER PRIMARY KEY,
+        email TEXT,
+        code TEXT UNIQUE,
+        discount INTEGER,
+        sentiment TEXT,
+        score INTEGER,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""")
+
+    # 🔴 NEW: full feedback log (original email + our reply)
+    c.execute("""CREATE TABLE IF NOT EXISTS feedback_log(
+        id INTEGER PRIMARY KEY,
+        email TEXT,
+        sentiment TEXT,
+        score INTEGER,
+        discount INTEGER,
+        code TEXT,
+        original_text TEXT,
+        reply_text TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""")
+
+    conn.commit()
+    return conn
+'''
+def _db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
     # Base table (old deployments might already have this without `action`)
     c.execute("""
         CREATE TABLE IF NOT EXISTS processed(
@@ -438,7 +473,7 @@ def _db():
 
     conn.commit()
     return conn
-
+'''
 
 def _get_thread_bundle(service, thread_id):
     """

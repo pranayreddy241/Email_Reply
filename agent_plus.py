@@ -391,6 +391,15 @@ def handle_feedback(conn, from_email_addr, name, subject, body_text, in_reply_to
     # 5) Send
     _send(from_email_addr, f"Re: {subject}", reply_body, in_reply_to=in_reply_to)
     print(f"[SENT feedback] {sentiment}/{score} -> {discount}% code={code} to {from_email_addr}")
+        # 🔴 NEW: store original email + our reply for the dashboard
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO feedback_log(email, sentiment, score, discount, code, original_text, reply_text) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (from_email_addr, sentiment, score, discount, code, body_text, reply_body),
+    )
+    conn.commit()
+
 
 def handle_message(conn, raw):
     msg = email.message_from_bytes(raw)

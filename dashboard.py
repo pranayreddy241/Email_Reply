@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Restaurant Email Agent – Owner Dashboard
+Restaurant Email Agent – Owner Dashboard (Premium)
 
-Run locally:
+Run:
   streamlit run dashboard.py
 
 Reads from SQLite:
-  - coupons      (created by the agent)
-  - feedback_log (original emails + replies, if you've added that table)
+  - coupons
+  - email_log (recommended; gives thread viewer + replies)
+  - feedback_log (fallback if email_log doesn't exist)
 
 Env:
   AGENT_DB_PATH
@@ -19,8 +20,7 @@ Env:
 
 import os
 import sqlite3
-from datetime import datetime, date
-from typing import Optional
+from datetime import datetime, date, timedelta
 
 import altair as alt
 import pandas as pd
@@ -35,461 +35,591 @@ RESERVATION_LINK = os.getenv("RESERVATION_LINK", "")
 OWNER_EMAIL = os.getenv("EMAIL_ADDRESS", "")
 LOGO_URL = os.getenv("LOGO_URL", "")
 
-
-# ---------- Data helpers ----------
+# ---------- DB helpers ----------
 
 def _connect() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    q = "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+    return conn.execute(q, (name,)).fetchone() is not None
 
 @st.cache_data(show_spinner=False)
 def load_coupons() -> pd.DataFrame:
+    conn = _connect()
     try:
-        conn = _connect()
         df = pd.read_sql_query(
             "SELECT email, code, discount, sentiment, score, created_at "
             "FROM coupons ORDER BY datetime(created_at) DESC",
             conn,
         )
-        conn.close()
         if not df.empty:
-            df["created_at"] = pd.to_datetime(df["created_at"])
+            df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
         return df
     except Exception as e:
         st.error(f"Could not load coupons from DB ({DB_PATH}): {e}")
-        return pd.DataFrame(
-            columns=["email", "code", "discount", "sentiment", "score", "created_at"]
-        )
-
+        return pd.DataFrame(columns=["email","code","discount","sentiment","score","created_at"])
+    finally:
+        conn.close()
 
 @st.cache_data(show_spinner=False)
-def load_feedback_log() -> pd.DataFrame:
-    """Original feedback emails + our replies (if table exists)."""
+def load_email_log() -> pd.DataFrame:
+    """
+    Preferred: email_log gives inbox/thread UX.
+    Expected columns (recommended by agent):
+      gmail_thread_id, gmail_msg_id, from_email, subject, intent, action,
+      received_at, original_text, reply_text, coupon_code, discount, sentiment, score, created_at
+    """
+    conn = _connect()
     try:
-        conn = _connect()
+        if not _table_exists(conn, "email_log"):
+            return pd.DataFrame()
         df = pd.read_sql_query(
-            "SELECT email, sentiment, score, discount, code, original_text, "
-            "reply_text, created_at "
+            "SELECT gmail_thread_id, gmail_msg_id, message_id, from_email, subject, intent, action, "
+            "received_at, original_text, reply_text, coupon_code, discount, sentiment, score, created_at "
+            "FROM email_log ORDER BY datetime(created_at) DESC",
+            conn,
+        )
+        if not df.empty:
+            for col in ["created_at", "received_at"]:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+@st.cache_data(show_spinner=False)
+def load_feedback_log_fallback() -> pd.DataFrame:
+    conn = _connect()
+    try:
+        if not _table_exists(conn, "feedback_log"):
+            return pd.DataFrame()
+        df = pd.read_sql_query(
+            "SELECT email, sentiment, score, discount, code, original_text, reply_text, created_at "
             "FROM feedback_log ORDER BY datetime(created_at) DESC",
             conn,
         )
-        conn.close()
         if not df.empty:
-            df["created_at"] = pd.to_datetime(df["created_at"])
+            df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
         return df
     except Exception:
-        # table might not exist yet – that's fine
-        return pd.DataFrame(
-            columns=[
-                "email", "sentiment", "score", "discount", "code",
-                "original_text", "reply_text", "created_at",
-            ]
-        )
-
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 # ---------- UI helpers ----------
 
-def _nice_date(dt: datetime) -> str:
+def _nice_dt(x) -> str:
     try:
-        return dt.strftime("%b %d, %Y %H:%M")
+        if pd.isna(x):
+            return ""
+        if isinstance(x, pd.Timestamp):
+            return x.strftime("%b %d, %Y %I:%M %p")
+        if isinstance(x, datetime):
+            return x.strftime("%b %d, %Y %I:%M %p")
+        return str(x)
     except Exception:
-        return str(dt)
+        return str(x)
 
+def _sentiment_badge(sentiment: str) -> str:
+    s = (sentiment or "neutral").lower()
+    if s == "positive":
+        return "tag-pos"
+    if s == "negative":
+        return "tag-neg"
+    return "tag-neu"
 
-def sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.markdown("### 🔍 Filters")
+def _anger_label(score: int) -> str:
+    if score >= 5:
+        return "🔥 Furious"
+    if score == 4:
+        return "😡 Angry"
+    if score == 3:
+        return "😐 Neutral"
+    if score == 2:
+        return "🙂 Happy"
+    return "😍 Raving"
 
-    sentiments = ["all"] + sorted(df["sentiment"].dropna().unique().tolist())
-    sentiment_choice = st.sidebar.selectbox("Sentiment", sentiments, index=0)
-
-    if not df.empty:
-        min_date = df["created_at"].min().date()
-        max_date = df["created_at"].max().date()
-    else:
-        today = date.today()
-        min_date = max_date = today
-
-    st.sidebar.markdown("#### Date range")
-    start = st.sidebar.date_input("From", min_date)
-    end = st.sidebar.date_input("To", max_date)
-
-    email_search = st.sidebar.text_input("Email contains", "")
-
-    filtered = df.copy()
-    if sentiment_choice != "all":
-        filtered = filtered[filtered["sentiment"] == sentiment_choice]
-
-    filtered = filtered[(filtered["created_at"].dt.date >= start) &
-                        (filtered["created_at"].dt.date <= end)]
-
-    if email_search.strip():
-        s = email_search.strip().lower()
-        filtered = filtered[filtered["email"].str.lower().str.contains(s)]
-
-    return filtered
-
+def _anger_color(score: int) -> str:
+    if score >= 5:
+        return "#ff2d2d"
+    if score == 4:
+        return "#ff6b2d"
+    if score == 3:
+        return "#fbbf24"
+    if score == 2:
+        return "#34d399"
+    return "#22c55e"
 
 def add_global_style():
     st.set_page_config(
-        page_title=f"{RESTAURANT_NAME} – Feedback Dashboard",
-        page_icon="🎟️",
+        page_title=f"{RESTAURANT_NAME} – Owner Dashboard",
+        page_icon="🍽️",
         layout="wide",
     )
     st.markdown(
         """
         <style>
         .stApp {
-            background: radial-gradient(circle at top left,#0f172a 0,#020617 45%,#020617 100%);
+            background: radial-gradient(circle at top left,#0b1220 0,#050914 40%,#020617 100%);
             color: #e5e7eb;
         }
-        .main > div {
-            padding-top: 1.0rem;
-        }
+        .main > div { padding-top: 0.9rem; }
+
         .soft-card {
-            background: rgba(15,23,42,0.96);
-            border-radius: 1.1rem;
+            background: rgba(15,23,42,0.88);
+            border-radius: 1.25rem;
             padding: 1.0rem 1.2rem;
-            box-shadow: 0 18px 40px rgba(0,0,0,0.5);
-            border: 1px solid rgba(148, 163, 184, 0.35);
+            box-shadow: 0 18px 45px rgba(0,0,0,0.6);
+            border: 1px solid rgba(148, 163, 184, 0.32);
+        }
+        .hero {
+            background: linear-gradient(135deg, rgba(2,6,23,1), rgba(17,24,39,1));
+            border-radius: 1.35rem;
+            padding: 1.1rem 1.2rem;
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            box-shadow: 0 22px 55px rgba(0,0,0,0.65);
         }
         .big-title {
-            font-size: 2.4rem;
-            font-weight: 800;
-            letter-spacing: 0.03em;
-            display: flex;
-            align-items: center;
-            gap: 0.8rem;
+            font-size: 2.2rem;
+            font-weight: 850;
+            letter-spacing: 0.02em;
             color: #f9fafb;
+            margin: 0;
         }
-        .logo-circle {
-            width: 44px;
-            height: 44px;
-            border-radius: 999px;
-            background: radial-gradient(circle at 30% 30%, #fecaca, #fb7185);
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            font-size: 1.4rem;
-            box-shadow: 0 10px 25px rgba(248,113,113,0.6);
+        .sub {
+            font-size:0.92rem;
+            color:#9ca3af;
+            margin-top: 0.15rem;
         }
         .accent-badge {
-            background: rgba(34,197,94,0.18);
+            background: rgba(34,197,94,0.15);
             color: #bbf7d0;
-            padding: 0.2rem 0.7rem;
+            padding: 0.25rem 0.75rem;
             border-radius: 999px;
             font-size: 0.75rem;
-            font-weight: 600;
+            font-weight: 650;
             text-transform: uppercase;
-            border: 1px solid rgba(34,197,94,0.5);
+            border: 1px solid rgba(34,197,94,0.45);
         }
         .metric-label {
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             text-transform: uppercase;
             color: #9ca3af;
-            letter-spacing: 0.09em;
+            letter-spacing: 0.1em;
             margin-bottom: 0.15rem;
         }
         .metric-value {
-            font-size: 1.9rem;
-            font-weight: 700;
-            color: #f9fafb;
-        }
-        .coupon-pill {
-            font-family: "SF Mono","Menlo",monospace;
-            font-weight: 700;
-            font-size: 1.0rem;
-            padding: 0.25rem 0.7rem;
-            border-radius: 999px;
-            border: 1px dashed rgba(248,250,252,0.6);
-            background: linear-gradient(135deg,#f97316,#ec4899);
+            font-size: 1.95rem;
+            font-weight: 780;
             color: #f9fafb;
         }
         .tag-badge {
-            padding: 0.15rem 0.6rem;
+            padding: 0.15rem 0.65rem;
             border-radius: 999px;
-            font-size: 0.7rem;
-            font-weight: 600;
+            font-size: 0.72rem;
+            font-weight: 650;
+            display:inline-block;
         }
         .tag-pos { background:#022c22; color:#6ee7b7; }
         .tag-neg { background:#450a0a; color:#fecaca; }
-        .tag-neu { background:#020617; color:#bfdbfe; border:1px solid rgba(148,163,184,0.7); }
+        .tag-neu { background:#0b1220; color:#bfdbfe; border:1px solid rgba(148,163,184,0.55); }
+
         .email-chip {
-            font-size: 0.8rem;
+            font-size: 0.82rem;
             color:#e5e7eb;
-            background: rgba(15,23,42,0.9);
-            padding:0.25rem 0.55rem;
+            background: rgba(2,6,23,0.7);
+            padding:0.28rem 0.62rem;
             border-radius:999px;
-            border:1px solid rgba(148,163,184,0.6);
+            border:1px solid rgba(148,163,184,0.55);
+            display:inline-block;
         }
-        .section-title {
-            font-size:1.1rem;
-            font-weight:600;
-            margin-bottom:0.4rem;
-            color:#e5e7eb;
+        .coupon-ticket {
+            border-radius: 1.1rem;
+            padding: 0.85rem 1rem;
+            background: linear-gradient(135deg,#f97316,#ec4899);
+            color: white;
+            border: 1px dashed rgba(255,255,255,0.7);
+            font-family: "SF Mono","Menlo",monospace;
+            font-weight: 800;
+            font-size: 1.05rem;
+            letter-spacing: 0.03em;
         }
+        .thread-bubble-user {
+            background: rgba(148,163,184,0.12);
+            border: 1px solid rgba(148,163,184,0.25);
+            border-radius: 1rem;
+            padding: 0.9rem 1rem;
+        }
+        .thread-bubble-agent {
+            background: rgba(34,197,94,0.10);
+            border: 1px solid rgba(34,197,94,0.25);
+            border-radius: 1rem;
+            padding: 0.9rem 1rem;
+        }
+        .small-muted { color:#9ca3af; font-size:0.82rem; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
+def sidebar_filters_default_30_days():
+    st.sidebar.markdown("### 🔍 Filters")
+    today = date.today()
+    default_from = today - timedelta(days=30)
 
-# ---------- Main layout ----------
+    start = st.sidebar.date_input("From", default_from)
+    end = st.sidebar.date_input("To", today)
+    sentiment = st.sidebar.selectbox("Sentiment", ["all","positive","neutral","negative"], index=0)
+    q = st.sidebar.text_input("Search email/subject contains", "")
+    return start, end, sentiment, q
+
+def apply_date_sentiment_search(df: pd.DataFrame, start: date, end: date, sentiment: str, q: str,
+                                date_col: str = "created_at",
+                                email_col: str = "email",
+                                subject_col: str = "subject") -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    if date_col in out.columns:
+        out = out[out[date_col].notna()]
+        out = out[(out[date_col].dt.date >= start) & (out[date_col].dt.date <= end)]
+
+    if sentiment != "all" and "sentiment" in out.columns:
+        out = out[out["sentiment"] == sentiment]
+
+    if q.strip():
+        s = q.strip().lower()
+        if email_col in out.columns:
+            out = out[out[email_col].fillna("").str.lower().str.contains(s) |
+                      out.get(subject_col, pd.Series([""]*len(out))).fillna("").astype(str).str.lower().str.contains(s)]
+    return out
+
+# ---------- Main ----------
 
 def main():
     add_global_style()
 
     coupons_df = load_coupons()
-    feedback_df = load_feedback_log()
+    email_log_df = load_email_log()
+    feedback_fallback_df = load_feedback_log_fallback()
 
     # Sidebar
     with st.sidebar:
         st.markdown("## ⚙️ Control panel")
-        st.markdown(
-            f"**Restaurant:** `{RESTAURANT_NAME}`  \n"
-            f"**DB:** `{os.path.basename(DB_PATH)}`"
-        )
-        filtered = sidebar_filters(coupons_df)
+        st.markdown(f"**Restaurant:** `{RESTAURANT_NAME}`  \n**DB:** `{os.path.basename(DB_PATH)}`")
+        start, end, sentiment, q = sidebar_filters_default_30_days()
 
         st.markdown("---")
         st.markdown("### 🔗 Quick links")
         if RESERVATION_LINK:
             st.markdown(f"• [Reservation page]({RESERVATION_LINK})")
         if OWNER_EMAIL:
-            st.markdown(f"• [Open Gmail](https://mail.google.com/mail/u/0/#inbox)")
+            st.markdown("• [Open Gmail](https://mail.google.com/mail/u/0/#inbox)")
 
         st.markdown("---")
-        st.markdown(
-            "### ☁️ Share with owner\n"
-            "Host this on **Streamlit Cloud** or **Render**, set the same env vars, "
-            "and send them the URL."
-        )
+        st.caption("Tip: Keep the agent running on a schedule (cron) so this stays live.")
 
-    # Header with logo
-    logo_html = ""
+    # Hero
     if LOGO_URL:
-        logo_html = f'<img src="{LOGO_URL}" alt="logo" style="width:42px;height:42px;border-radius:999px;object-fit:cover;box-shadow:0 12px 30px rgba(0,0,0,0.55);" />'
+        logo = f'<img src="{LOGO_URL}" style="width:48px;height:48px;border-radius:999px;object-fit:cover;border:1px solid rgba(148,163,184,0.35);" />'
     else:
         initials = (RESTAURANT_NAME[:2] or "R").upper()
-        logo_html = f'<div class="logo-circle">{initials}</div>'
+        logo = f'<div style="width:48px;height:48px;border-radius:999px;background:linear-gradient(135deg,#fb7185,#7c5cff);display:flex;align-items:center;justify-content:center;font-weight:900;color:white;">{initials}</div>'
 
     st.markdown(
         f"""
-        <div class="soft-card" style="margin-bottom:1.0rem; background:linear-gradient(135deg,#020617,#111827);">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:1.2rem;">
+        <div class="hero">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;">
             <div style="display:flex;align-items:center;gap:0.9rem;">
-              {logo_html}
+              {logo}
               <div>
-                <div class="big-title">
-                  <span>{RESTAURANT_NAME}</span>
-                </div>
-                <div style="font-size:0.9rem;color:#9ca3af;margin-top:0.1rem;">
-                  Live command center for feedback, coupons and replies.
-                </div>
+                <div class="big-title">{RESTAURANT_NAME}</div>
+                <div class="sub">Owner command center • feedback • coupons • replies • threads</div>
               </div>
             </div>
-            <div>
-              <span class="accent-badge">Feedback engine online</span>
-            </div>
+            <div><span class="accent-badge">engine online</span></div>
           </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if coupons_df.empty:
-        st.warning("No coupons found yet. Once the agent replies to feedback emails, they’ll show up here.")
-        return
+    st.markdown("")
 
-    # Metrics row
-    total = len(filtered)
-    avg_disc = round(filtered["discount"].mean(), 2) if total else 0.0
-    neg_count = int((filtered["sentiment"] == "negative").sum())
-    pos_count = int((filtered["sentiment"] == "positive").sum())
+    # Filtered views
+    filtered_coupons = apply_date_sentiment_search(
+        coupons_df, start, end, sentiment, q,
+        date_col="created_at", email_col="email", subject_col="email"
+    )
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
+    # For inbox, prefer email_log; fallback to feedback_log
+    using_email_log = not email_log_df.empty
+    if using_email_log:
+        inbox_df = email_log_df.copy()
+        inbox_df = inbox_df.rename(columns={"from_email":"email"})
+        filtered_inbox = apply_date_sentiment_search(
+            inbox_df, start, end, sentiment, q,
+            date_col="created_at", email_col="email", subject_col="subject"
+        )
+    else:
+        # fallback: no subject/thread fields
+        fb = feedback_fallback_df.copy()
+        filtered_inbox = apply_date_sentiment_search(
+            fb, start, end, sentiment, q,
+            date_col="created_at", email_col="email", subject_col="email"
+        )
+
+    # Metrics
+    total = int(len(filtered_coupons)) if not filtered_coupons.empty else 0
+    avg_disc = float(round(filtered_coupons["discount"].mean(), 2)) if total else 0.0
+    neg = int((filtered_coupons["sentiment"] == "negative").sum()) if total else 0
+    pos = int((filtered_coupons["sentiment"] == "positive").sum()) if total else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
         st.markdown('<div class="metric-label">Total coupons</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value">{total}</div>', unsafe_allow_html=True)
-    with col2:
+    with m2:
         st.markdown('<div class="metric-label">Avg discount %</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value">{avg_disc}</div>', unsafe_allow_html=True)
-    with col3:
+    with m3:
         st.markdown('<div class="metric-label">Negative feedback</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value">{neg_count}</div>', unsafe_allow_html=True)
-    with col4:
+        st.markdown(f'<div class="metric-value">{neg}</div>', unsafe_allow_html=True)
+    with m4:
         st.markdown('<div class="metric-label">Raving fans</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value">{pos_count}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{pos}</div>', unsafe_allow_html=True)
 
     st.markdown("")
 
-    # Tabs: Coupons vs Emails
-    tab1, tab2 = st.tabs(["🎟 Coupons overview", "✉️ Emails & replies"])
+    tab1, tab2, tab3 = st.tabs(["🧠 Command Center", "📬 Inbox (Threads)", "🎟 Coupons"])
 
+    # ---------------- Tab 1: Command Center ----------------
     with tab1:
-        c1, c2 = st.columns([1.1, 1])
+        left, right = st.columns([1.1, 0.9])
 
-        with c1:
-            st.markdown('<div class="section-title">Sentiment & discount overview</div>', unsafe_allow_html=True)
-
-            if not filtered.empty:
+        with left:
+            st.markdown('<div class="soft-card">', unsafe_allow_html=True)
+            st.markdown("#### Sentiment overview")
+            if filtered_coupons.empty:
+                st.info("No coupons in this date range yet.")
+            else:
                 sentiment_counts = (
-                    filtered.groupby("sentiment")
-                    .size()
-                    .reset_index(name="count")
+                    filtered_coupons.groupby("sentiment")
+                    .size().reset_index(name="count")
                 )
                 bar = (
                     alt.Chart(sentiment_counts)
-                    .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                    .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
                     .encode(
                         x=alt.X("sentiment:N", title="Sentiment"),
-                        y=alt.Y("count:Q", title="Number of coupons"),
-                        tooltip=["sentiment", "count"],
+                        y=alt.Y("count:Q", title="Coupons"),
+                        tooltip=["sentiment","count"],
                         color=alt.Color("sentiment:N", legend=None),
                     )
-                    .properties(height=260)
+                    .properties(height=240)
                 )
                 st.altair_chart(bar, use_container_width=True)
 
-            daily = (
-                filtered.copy()
-                .assign(day=lambda d: d["created_at"].dt.date)
-                .groupby("day")
-                .size()
-                .reset_index(name="coupons")
-            )
-            if not daily.empty:
+                daily = (
+                    filtered_coupons.assign(day=lambda d: d["created_at"].dt.date)
+                    .groupby("day").size().reset_index(name="coupons")
+                )
                 line = (
                     alt.Chart(daily)
                     .mark_line(point=True)
                     .encode(
                         x=alt.X("day:T", title="Day"),
                         y=alt.Y("coupons:Q", title="Coupons issued"),
-                        tooltip=["day", "coupons"],
+                        tooltip=["day","coupons"],
                     )
-                    .properties(height=260)
+                    .properties(height=240)
                 )
                 st.altair_chart(line, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        with c2:
-            st.markdown('<div class="section-title">Latest coupons</div>', unsafe_allow_html=True)
-            latest = filtered.head(6)
-            for _, row in latest.iterrows():
-                sentiment = row["sentiment"] or "neutral"
-                tag_class = (
-                    "tag-pos" if sentiment == "positive"
-                    else "tag-neg" if sentiment == "negative"
-                    else "tag-neu"
-                )
-                st.markdown(
-                    f"""
-                    <div class="soft-card" style="margin-bottom:0.7rem;">
-                      <div style="display:flex;justify-content:space-between;align-items:center;gap:0.6rem;">
-                        <div style="flex:1;">
-                          <div class="email-chip">{row['email']}</div>
-                          <div class="coupon-pill" style="margin-top:0.35rem;">{row['code']}</div>
+        with right:
+            st.markdown('<div class="soft-card">', unsafe_allow_html=True)
+            st.markdown("#### Latest coupons")
+            if filtered_coupons.empty:
+                st.info("No coupons yet.")
+            else:
+                for _, row in filtered_coupons.head(6).iterrows():
+                    s = (row.get("sentiment") or "neutral")
+                    badge = _sentiment_badge(s)
+                    code = row.get("code", "")
+                    st.markdown(
+                        f"""
+                        <div style="margin-bottom:0.85rem;">
+                          <div class="email-chip">{row.get('email','')}</div>
+                          <div style="display:flex;justify-content:space-between;align-items:center;gap:0.8rem;margin-top:0.55rem;">
+                            <div class="coupon-ticket" style="flex:1;">{code}</div>
+                            <div style="text-align:right;min-width:90px;">
+                              <div class="small-muted">Discount</div>
+                              <div style="font-size:1.45rem;font-weight:850;color:#f97316;">{int(row.get('discount',0))}%</div>
+                              <span class="tag-badge {badge}">{s}</span>
+                            </div>
+                          </div>
+                          <div class="small-muted" style="margin-top:0.35rem;">Issued {_nice_dt(row.get('created_at'))}</div>
                         </div>
-                        <div style="text-align:right;">
-                          <div style="font-size:0.78rem;color:#9ca3af;">Discount</div>
-                          <div style="font-size:1.4rem;font-weight:700;color:#f97316;">{int(row['discount'])}%</div>
-                          <span class="tag-badge {tag_class}">{sentiment}</span>
-                        </div>
-                      </div>
-                      <div style="margin-top:0.4rem;font-size:0.75rem;color:#9ca3af;">
-                        Issued at {_nice_date(row['created_at'])}
-                      </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    cols = st.columns([0.5, 0.5])
+                    with cols[0]:
+                        st.code(code, language="text")
+                    with cols[1]:
+                        st.caption("Copy the code from above.")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown('<div class="section-title">Full coupons log</div>', unsafe_allow_html=True)
-        st.dataframe(
-            filtered.assign(created_at=filtered["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S")),
-            use_container_width=True,
-            hide_index=True,
-        )
-        csv = filtered.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download as CSV",
-            csv,
-            file_name="restaurant_coupons.csv",
-            mime="text/csv",
-        )
-
+    # ---------------- Tab 2: Inbox (Threads) ----------------
     with tab2:
-        st.markdown('<div class="section-title">Feedback emails & our replies</div>', unsafe_allow_html=True)
-        if feedback_df.empty:
-            st.info(
-                "No feedback emails logged yet. "
-                "Make sure `feedback_log` table exists and `handle_feedback()` inserts into it."
-            )
-        else:
-            # optional sentiment filter specifically for emails
-            email_sentiments = ["all"] + sorted(feedback_df["sentiment"].dropna().unique().tolist())
-            esel = st.selectbox("Filter by sentiment", email_sentiments, index=0)
-            emails_view = feedback_df.copy()
-            if esel != "all":
-                emails_view = emails_view[emails_view["sentiment"] == esel]
+        st.markdown('<div class="soft-card">', unsafe_allow_html=True)
 
-            for _, row in emails_view.head(15).iterrows():
-                sentiment = row["sentiment"] or "neutral"
-                tag_class = (
-                    "tag-pos" if sentiment == "positive"
-                    else "tag-neg" if sentiment == "negative"
-                    else "tag-neu"
-                )
+        if filtered_inbox.empty:
+            if using_email_log:
+                st.info("No inbox items in this range yet. Run the agent so email_log gets populated.")
+            else:
+                st.info("No feedback logged yet. Your agent must insert into feedback_log or (better) email_log.")
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("#### Inbox viewer")
+            st.caption("Select an item on the left to view the customer email + your reply on the right.")
+
+            left, right = st.columns([0.44, 0.56], gap="large")
+
+            with left:
+                # Build list items
+                view = filtered_inbox.copy()
+
+                if using_email_log:
+                    # show only feedback/reservation first if you want; keep all now
+                    view["score"] = pd.to_numeric(view.get("score"), errors="coerce").fillna(3).astype(int)
+                    view["label"] = view.apply(
+                        lambda r: f"{r.get('email','')} • {r.get('subject','(no subject)')[:34]} • {_anger_label(int(r.get('score',3)))}",
+                        axis=1
+                    )
+                    options = view["label"].tolist()
+                else:
+                    # fallback feedback_log has no subject
+                    view["score"] = pd.to_numeric(view.get("score"), errors="coerce").fillna(3).astype(int)
+                    view["label"] = view.apply(
+                        lambda r: f"{r.get('email','')} • {_anger_label(int(r.get('score',3)))} • {_nice_dt(r.get('created_at'))}",
+                        axis=1
+                    )
+                    options = view["label"].tolist()
+
+                sel = st.radio("Inbox", options, index=0, label_visibility="collapsed")
+                idx = options.index(sel)
+                row = view.iloc[idx]
+
+            with right:
+                # Header block
+                sentiment = (row.get("sentiment") or "neutral")
+                badge = _sentiment_badge(sentiment)
+                score = int(row.get("score", 3) or 3)
+                anger = _anger_label(score)
+
                 st.markdown(
                     f"""
-                    <div class="soft-card" style="margin-bottom:0.75rem;">
-                      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:0.8rem;">
-                        <div style="flex:1;">
-                          <div class="email-chip">{row['email']}</div>
-                          <div style="margin-top:0.25rem;font-size:0.8rem;color:#9ca3af;">
-                            Code <span style="font-family:'SF Mono','Menlo',monospace;">{row['code']}</span>
-                            &nbsp;·&nbsp; <strong>{int(row['discount'])}%</strong> off
-                          </div>
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;">
+                      <div>
+                        <div class="email-chip">{row.get('email','')}</div>
+                        <div style="margin-top:0.35rem;font-size:1.05rem;font-weight:800;color:#f9fafb;">
+                          {row.get('subject','(no subject)') if using_email_log else "Feedback"}
                         </div>
-                        <div style="text-align:right;">
-                          <span class="tag-badge {tag_class}">{sentiment}</span>
-                          <div style="font-size:0.7rem;color:#9ca3af;margin-top:0.18rem;">
-                            {_nice_date(row['created_at'])}
-                          </div>
+                        <div class="small-muted" style="margin-top:0.15rem;">
+                          {_nice_dt(row.get('created_at'))}
+                        </div>
+                      </div>
+                      <div style="text-align:right;">
+                        <span class="tag-badge {badge}">{sentiment}</span>
+                        <div style="margin-top:0.45rem;font-weight:850;color:{_anger_color(score)};">
+                          {anger} (score {score}/5)
                         </div>
                       </div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
-                with st.expander("View customer email"):
-                    st.write(row["original_text"] or "(empty)")
-                with st.expander("View our reply"):
-                    st.write(row["reply_text"] or "(empty)")
 
-    # How it works
+                st.markdown("")
+                if row.get("coupon_code") or row.get("code"):
+                    code = row.get("coupon_code") or row.get("code")
+                    disc = row.get("discount")
+                    st.markdown("##### Coupon")
+                    st.markdown(f'<div class="coupon-ticket">{code}</div>', unsafe_allow_html=True)
+                    cols = st.columns([0.55, 0.45])
+                    with cols[0]:
+                        st.code(code, language="text")
+                    with cols[1]:
+                        try:
+                            st.metric("Discount", f"{int(disc)}%")
+                        except Exception:
+                            st.metric("Discount", f"{disc}%")
+
+                # Anger meter (simple progress)
+                st.markdown("##### Anger meter")
+                st.progress(score / 5.0)
+
+                st.markdown("##### Customer email")
+                st.markdown(f'<div class="thread-bubble-user">{(row.get("original_text") or "(empty)").replace("\\n","<br>")}</div>', unsafe_allow_html=True)
+
+                st.markdown("##### Our reply")
+                reply = row.get("reply_text") or "(not logged yet)"
+                st.markdown(f'<div class="thread-bubble-agent">{reply.replace("\\n","<br>")}</div>', unsafe_allow_html=True)
+
+                st.markdown("")
+                st.markdown("##### Quick actions")
+                a1, a2, a3 = st.columns(3)
+                with a1:
+                    if RESERVATION_LINK:
+                        st.link_button("Open reservation page", RESERVATION_LINK)
+                with a2:
+                    st.link_button("Open Gmail inbox", "https://mail.google.com/mail/u/0/#inbox")
+                with a3:
+                    st.caption("Easter egg: type `konami` in search 😄")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------------- Tab 3: Coupons ----------------
+    with tab3:
+        st.markdown('<div class="soft-card">', unsafe_allow_html=True)
+        st.markdown("#### Coupons table")
+        if filtered_coupons.empty:
+            st.info("No coupons in this range.")
+        else:
+            show = filtered_coupons.copy()
+            show["created_at"] = show["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+            csv = filtered_coupons.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download CSV",
+                csv,
+                file_name="restaurant_coupons.csv",
+                mime="text/csv",
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown("---")
-    with st.expander("ℹ️ How this system works & setup checklist", expanded=False):
+    with st.expander("ℹ️ Setup checklist (agent + dashboard)", expanded=False):
         st.markdown(
             """
-            1. **Agent (`agent.py`)** reads new emails from Gmail, decides what to do, and:
-               - Replies automatically to feedback emails with a coupon  
-               - Stores coupons in the `coupons` table  
-               - (With the snippet we added) stores original email + reply in `feedback_log`
+            **To get the best Inbox (Threads) experience**, your agent should write to `email_log`.
 
-            2. **This dashboard (`dashboard.py`)**:
-               - Connects to the same SQLite DB (`AGENT_DB_PATH`)  
-               - Renders charts, metrics, and coupon cards  
-               - Shows full email + reply text under *Emails & replies* tab  
+            Recommended columns to log in agent:
+            - gmail_thread_id, gmail_msg_id, from_email, subject, intent, action, received_at
+            - original_text, reply_text
+            - coupon_code, discount, sentiment, score
+            - created_at
 
-            3. **To run everything:**
-               - `.env` with `OPENAI_API_KEY`, Gmail `EMAIL_ADDRESS` + app password,  
-                 `RESTAURANT_NAME`, `AGENT_DB_PATH`, etc.  
-               - `client_secret.json` + `token.json` for the Gmail API agent.  
-               - Run `python agent.py` on a schedule (cron / PM2 / background service).  
-               - Run `streamlit run dashboard.py` locally or host it on Streamlit Cloud.
+            Dashboard defaults to **last 30 days**.
             """
         )
-
 
 if __name__ == "__main__":
     main()

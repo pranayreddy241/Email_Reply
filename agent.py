@@ -1,61 +1,49 @@
 #!/usr/bin/env python3
 """
-Baseline Restaurant Email Agent (Gmail API / OAuth)
-- Fetch unread messages (INBOX) via Gmail API
-- Use LLM (llm_agent.py) to understand intent (reservation / review / other)
-- Auto-reply reservations (confirm or ask missing details)
-- Stage non-urgent replies as local SQLite drafts
-- Prevent double-processing by Message-ID
+Restaurant Email Agent (Gmail API / OAuth + LLM)
+- Fetch unread messages via Gmail API
+- Use llm_agent.py to decide action: confirm / ask_missing / feedback / skip
+- Auto-reply reservations
+- Auto-reply feedback with sentiment + coupon + personalized reply
+- Prevent double-processing using SQLite `processed` table (Message-ID)
+- Log feedback emails + replies in `feedback_log`
+- Mark processed emails as READ in Gmail (remove UNREAD label)
 
 Usage:
   python agent.py
   python agent.py --send-pending
 
-Env (example):
-  RESTAURANT_NAME="Your Restaurant"
-  RESERVATION_PHONE="+1..."
-  RESERVATION_LINK="https://..."
-  AGENT_DB_PATH="email_agent.sqlite"
-
-Files required:
-  - client_secret.json (OAuth client credentials)
-  - token.json (created automatically on first run)
+Requires:
+  client_secret.json (OAuth)
+  token.json (auto-generated)
+  .env with OPENAI_API_KEY, etc.
 """
 
 from __future__ import print_function
+
 import os
 import re
 import sqlite3
 import email
 import base64
-import time, string
+import time
 import random
-import json
-from datetime import datetime, timedelta
-
-import pytz
-from dateutil import parser as dateparser
+import string
 from email.message import EmailMessage
 from email.header import decode_header, make_header
 
 from dotenv import load_dotenv
+
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# Your LLM helper module
+# LLM helper module (your file)
 from llm_agent import summarize_thread, call_llm_extract, decide_action, received_local_dt
 
 load_dotenv()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
-
-# ---- OpenAI client (new SDK) ----
-from openai import OpenAI
-_oai = OpenAI(api_key=OPENAI_API_KEY)  # used inside llm_agent, mainly
 
 # ----------------- Config -----------------
 RESTAURANT_NAME = os.getenv("RESTAURANT_NAME", "My Restaurant")
@@ -66,6 +54,7 @@ DB_PATH = os.getenv("AGENT_DB_PATH", "email_agent.sqlite")
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 
+# ----------------- Gmail helpers -----------------
 def _is_no_reply(addr, msg):
     """Filter obvious marketing / no-reply senders."""
     a = (addr or "").lower()
@@ -76,7 +65,6 @@ def _is_no_reply(addr, msg):
     return False
 
 
-# ----------------- Gmail API auth -----------------
 def get_gmail_service():
     """Authenticate (OAuth) and return a Gmail API service."""
     creds = None
@@ -93,7 +81,7 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
-# ----------------- Helpers -----------------
+# ----------------- Parsing helpers -----------------
 def _dec(s):
     if not s:
         return ""
@@ -138,14 +126,13 @@ def _body(msg):
 def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
     """Send a message via Gmail API."""
     m = EmailMessage()
-    # Use authenticated user's email as sender
     sender_email = service.users().getProfile(userId="me").execute().get("emailAddress", "me")
     m["From"] = sender_email
     m["To"] = to_addr
     m["Subject"] = subject
     if in_reply_to:
         m["In-Reply-To"] = in_reply_to
-        m["References"]  = in_reply_to
+        m["References"] = in_reply_to
     m.set_content(body)
 
     raw = base64.urlsafe_b64encode(m.as_bytes()).decode("utf-8")
@@ -192,49 +179,67 @@ def _tpl_confirm(name, d, t, p):
     L += ["", "We look forward to hosting you!", f"— {RESTAURANT_NAME}"]
     return "\n".join(L)
 
-# ---- Feedback helpers (sentiment + coupons) ----
 
+def _tpl_missing(name, hd, ht, hp):
+    miss = [x for x, v in {"date": hd, "time": ht, "party size": hp}.items() if not v]
+    L = [
+        f"Hi{(' ' + name) if name else ''},",
+        f"Thanks for booking at {RESTAURANT_NAME}.",
+        "Could you confirm your " + ", ".join(miss) + " so we can finalize your reservation?",
+    ]
+    if RESERVATION_LINK:
+        L.append(f"You can also book directly here: {RESERVATION_LINK}")
+    L += ["", "Best,", RESTAURANT_NAME]
+    return "\n".join(L)
+
+
+# ----------------- Feedback helpers (sentiment + coupons) -----------------
 def analyze_sentiment_with_backoff(message_text: str):
     """
     Returns (sentiment:str, score:int [1..5]).
     sentiment in {'positive','neutral','negative'}; score 1=very happy .. 5=furious.
-    Uses OpenAI with retry, then a simple heuristic fallback.
+    Uses OpenAI with retry, then heuristic fallback.
     """
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = os.getenv("OPENAI_API_KEY")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    if client and os.getenv("OPENAI_API_KEY"):
-        for attempt in range(4):
-            try:
-                prompt = (
-                    "Rate the customer's tone.\n"
-                    "Return strict JSON: {\"sentiment\":\"positive|neutral|negative\",\"score\":1-5}.\n"
-                    "Guidelines: 1 very happy, 3 neutral, 5 extremely upset.\n\n"
-                    f"Message:\n{message_text}"
-                )
-                resp = client.chat.completions.create(
-                    model=model,
-                    temperature=0.2,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=60
-                )
-                txt = resp.choices[0].message.content.strip()
-                import json
-                obj = json.loads(txt)
-                s = str(obj.get("sentiment", "neutral")).lower()
-                sc = int(obj.get("score", 3))
-                sc = max(1, min(5, sc))
-                if s not in {"positive", "neutral", "negative"}:
-                    s = "neutral"
-                return s, sc
-            except Exception as e:
-                wait = 2 ** attempt
-                print(f"[WARN] OpenAI sentiment attempt {attempt+1} failed: {e} (retry {wait}s)")
-                time.sleep(wait)
+    if api_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+        except Exception:
+            client = None
 
-    # Heuristic fallback if OpenAI fails or quota issue
-    t = message_text.lower()
+        if client:
+            for attempt in range(4):
+                try:
+                    prompt = (
+                        "Rate the customer's tone.\n"
+                        "Return strict JSON: {\"sentiment\":\"positive|neutral|negative\",\"score\":1-5}.\n"
+                        "Guidelines: 1 very happy, 3 neutral, 5 extremely upset.\n\n"
+                        f"Message:\n{message_text}"
+                    )
+                    resp = client.chat.completions.create(
+                        model=model,
+                        temperature=0.2,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=60
+                    )
+                    txt = resp.choices[0].message.content.strip()
+                    obj = __import__("json").loads(txt)
+                    s = str(obj.get("sentiment", "neutral")).lower()
+                    sc = int(obj.get("score", 3))
+                    sc = max(1, min(5, sc))
+                    if s not in {"positive", "neutral", "negative"}:
+                        s = "neutral"
+                    return s, sc
+                except Exception as e:
+                    wait = 2 ** attempt
+                    print(f"[WARN] OpenAI sentiment attempt {attempt+1} failed: {e} (retry {wait}s)")
+                    time.sleep(wait)
+
+    # Heuristic fallback
+    t = (message_text or "").lower()
     neg_hits = sum(w in t for w in [
         "awful", "terrible", "horrible", "disgusting", "cold", "late",
         "rude", "bad", "worst", "never again", "refund", "angry", "disappointed"
@@ -243,7 +248,6 @@ def analyze_sentiment_with_backoff(message_text: str):
         "amazing", "great", "excellent", "love", "loved", "fantastic",
         "wonderful", "perfect", "delicious", "best"
     ])
-
     if neg_hits >= 3: return "negative", 5
     if neg_hits == 2: return "negative", 4
     if neg_hits == 1: return "negative", 3
@@ -253,29 +257,16 @@ def analyze_sentiment_with_backoff(message_text: str):
 
 
 def choose_discount(sentiment: str, score: int, message_text: str) -> int:
-    """
-    Map sentiment + upset score -> discount between 5% and 40%.
-    """
-    text = message_text.lower()
-
+    text = (message_text or "").lower()
     if sentiment == "positive":
-        enthusiastic = any(w in text for w in [
-            "love", "loved", "amazing", "incredible", "fantastic", "perfect", "best"
-        ])
+        enthusiastic = any(w in text for w in ["love", "loved", "amazing", "incredible", "fantastic", "perfect", "best"])
         return 10 if enthusiastic else 5
-
     if sentiment == "neutral":
         return 15
-
-    # negative
     mapping = {3: 15, 4: 25, 5: 30}
     disc = mapping.get(score, 15)
-
-    if score == 5 and any(w in text for w in [
-        "worst", "never again", "refund", "disgusting", "unacceptable", "furious"
-    ]):
+    if score == 5 and any(w in text for w in ["worst", "never again", "refund", "disgusting", "unacceptable", "furious"]):
         disc = 40
-
     return min(disc, 40)
 
 
@@ -293,53 +284,62 @@ def persist_coupon(conn, email_addr: str, code: str, discount: int, sentiment: s
     conn.commit()
 
 
+def log_feedback(conn, email_addr: str, sentiment: str, score: int, discount: int,
+                 code: str, original_text: str, reply_text: str):
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO feedback_log(email, sentiment, score, discount, code, original_text, reply_text)
+        VALUES (?,?,?,?,?,?,?)
+    """, (email_addr, sentiment, score, discount, code, original_text, reply_text))
+    conn.commit()
+
+
 def generate_personalized_reply(name: str, sentiment: str, score: int,
                                 discount: int, code: str, message_text: str) -> str:
-    """
-    Use GPT to craft a short, kind, personalized reply (80–120 words).
-    Falls back to compact templates if OpenAI unavailable.
-    """
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = os.getenv("OPENAI_API_KEY")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    if client and os.getenv("OPENAI_API_KEY"):
-        for attempt in range(4):
-            try:
-                sys = (
-                    "You are a warm, concise customer service writer for a restaurant. "
-                    "Write a SHORT, sincere, human reply (80–120 words). "
-                    "Personalize tone to the customer's sentiment and upset score. "
-                    "Always include the exact coupon code and % once. "
-                    "Avoid generic boilerplates; vary the phrasing. "
-                    "Sign off with the restaurant name only."
-                )
-                user = (
-                    f"Restaurant: {RESTAURANT_NAME}\n"
-                    f"Customer name: {name or 'Guest'}\n"
-                    f"Sentiment: {sentiment}\n"
-                    f"Upset score (1 very happy .. 5 furious): {score}\n"
-                    f"Discount: {discount}%\n"
-                    f"Coupon code: {code}\n"
-                    f"Customer message:\n{message_text}\n"
-                    "Write the reply body only."
-                )
-                resp = client.chat.completions.create(
-                    model=model,
-                    temperature=0.7,
-                    messages=[
-                        {"role": "system", "content": sys},
-                        {"role": "user", "content": user},
-                    ],
-                    max_tokens=240,
-                )
-                return resp.choices[0].message.content.strip()
-            except Exception as e:
-                wait = 2 ** attempt
-                print(f"[WARN] OpenAI reply attempt {attempt+1} failed: {e} (retry {wait}s)")
-                time.sleep(wait)
+    if api_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+        except Exception:
+            client = None
 
-    # Fallback templates if GPT fails
+        if client:
+            for attempt in range(4):
+                try:
+                    sys = (
+                        "You are a warm, concise customer service writer for a restaurant. "
+                        "Write a SHORT, sincere, human reply (80–120 words). "
+                        "Personalize tone to the customer's sentiment and upset score. "
+                        "Always include the exact coupon code and % once. "
+                        "Avoid generic boilerplates; vary the phrasing. "
+                        "Sign off with the restaurant name only."
+                    )
+                    user = (
+                        f"Restaurant: {RESTAURANT_NAME}\n"
+                        f"Customer name: {name or 'Guest'}\n"
+                        f"Sentiment: {sentiment}\n"
+                        f"Upset score (1 very happy .. 5 furious): {score}\n"
+                        f"Discount: {discount}%\n"
+                        f"Coupon code: {code}\n"
+                        f"Customer message:\n{message_text}\n"
+                        "Write the reply body only."
+                    )
+                    resp = client.chat.completions.create(
+                        model=model,
+                        temperature=0.7,
+                        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+                        max_tokens=240,
+                    )
+                    return resp.choices[0].message.content.strip()
+                except Exception as e:
+                    wait = 2 ** attempt
+                    print(f"[WARN] OpenAI reply attempt {attempt+1} failed: {e} (retry {wait}s)")
+                    time.sleep(wait)
+
+    # Fallback templates
     if sentiment == "positive":
         return (
             f"Hi{(' ' + name) if name else ''},\n\n"
@@ -351,10 +351,9 @@ def generate_personalized_reply(name: str, sentiment: str, score: int,
         return (
             f"Hi{(' ' + name) if name else ''},\n\n"
             f"Thanks for sharing your thoughts—your feedback helps us improve. "
-            f"Please accept {discount}% off your next visit (code: {code}); "
-            f"we’d love another chance to impress.\n\n— {RESTAURANT_NAME}"
+            f"Please accept {discount}% off your next visit (code: {code}); we’d love another chance to impress.\n\n"
+            f"— {RESTAURANT_NAME}"
         )
-
     opener = "We’re truly sorry" if score >= 4 else "We’re sorry"
     return (
         f"Hi{(' ' + name) if name else ''},\n\n"
@@ -363,85 +362,21 @@ def generate_personalized_reply(name: str, sentiment: str, score: int,
         f"We appreciate the chance to earn back your trust.\n\n— {RESTAURANT_NAME}"
     )
 
-def _tpl_missing(name, hd, ht, hp):
-    miss = [x for x, v in {"date": hd, "time": ht, "party size": hp}.items() if not v]
-    L = [
-        f"Hi{(' ' + name) if name else ''},",
-        f"Thanks for booking at {RESTAURANT_NAME}.",
-        "Could you confirm your " + ", ".join(miss) + " so we can finalize your reservation?",
-    ]
-    if RESERVATION_LINK:
-        L.append(f"You can also book directly here: {RESERVATION_LINK}")
-    L += ["", "Best,", RESTAURANT_NAME]
-    return "\n".join(L)
 
-
-def _tpl_review(name):
-    return (
-        f"Hi{(' ' + name) if name else ''},\n\n"
-        f"Thank you for your feedback about {RESTAURANT_NAME}. We appreciate it!\n\n"
-        f"— {RESTAURANT_NAME}\n"
-    )
-
-
-def _tpl_other(name):
-    return (
-        f"Hi{(' ' + name) if name else ''},\n\n"
-        f"Thanks for reaching out to {RESTAURANT_NAME}. We'll get back to you shortly.\n\n"
-        f"— {RESTAURANT_NAME}\n"
-    )
-
-
+# ----------------- DB (with migrations) -----------------
 def _db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    c.execute("CREATE TABLE IF NOT EXISTS processed(message_id TEXT PRIMARY KEY, processed_at TEXT)")
-    c.execute("""CREATE TABLE IF NOT EXISTS drafts(
-        id INTEGER PRIMARY KEY,
-        to_email TEXT, subject TEXT, body TEXT, in_reply_to TEXT, created_at TEXT, sent_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS coupons(
-        id INTEGER PRIMARY KEY,
-        email TEXT,
-        code TEXT UNIQUE,
-        discount INTEGER,
-        sentiment TEXT,
-        score INTEGER,
-        created_at TEXT DEFAULT (datetime('now'))
-    )""")
-
-    # 🔴 NEW: full feedback log (original email + our reply)
-    c.execute("""CREATE TABLE IF NOT EXISTS feedback_log(
-        id INTEGER PRIMARY KEY,
-        email TEXT,
-        sentiment TEXT,
-        score INTEGER,
-        discount INTEGER,
-        code TEXT,
-        original_text TEXT,
-        reply_text TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
-    )""")
-
-    conn.commit()
-    return conn
-'''
-def _db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Base table (old deployments might already have this without `action`)
+    # processed table (needs action)
     c.execute("""
         CREATE TABLE IF NOT EXISTS processed(
             message_id TEXT PRIMARY KEY,
             processed_at TEXT
         )
     """)
-
-    # 🔧 Ensure `action` column exists (migrate old DBs safely)
     c.execute("PRAGMA table_info(processed)")
-    cols = [row[1] for row in c.fetchall()]  # row[1] is column name
+    cols = [row[1] for row in c.fetchall()]
     if "action" not in cols:
         c.execute("ALTER TABLE processed ADD COLUMN action TEXT")
 
@@ -471,10 +406,26 @@ def _db():
         )
     """)
 
+    # feedback log table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS feedback_log(
+            id INTEGER PRIMARY KEY,
+            email TEXT,
+            sentiment TEXT,
+            score INTEGER,
+            discount INTEGER,
+            code TEXT,
+            original_text TEXT,
+            reply_text TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
     conn.commit()
     return conn
-'''
 
+
+# ----------------- Thread + fetch helpers -----------------
 def _get_thread_bundle(service, thread_id):
     """
     Return a condensed list of dicts for the last few messages in a thread:
@@ -482,7 +433,7 @@ def _get_thread_bundle(service, thread_id):
     """
     data = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
     items = []
-    for part in data.get("messages", [])[-4:]:  # last 4 messages
+    for part in data.get("messages", [])[-4:]:
         payload = part.get("payload", {})
         headers = payload.get("headers", [])
 
@@ -495,7 +446,6 @@ def _get_thread_bundle(service, thread_id):
         frm = hdr("From") or ""
         subj = hdr("Subject") or ""
         date = hdr("Date") or ""
-
         body = ""
 
         def walk(parts):
@@ -525,7 +475,6 @@ def _fetch_unseen(service):
     Return list of tuples: (msg_id, thread_id, raw_bytes) for unread messages.
     Uses robust retries.
     """
-
     def _pull(query=None, labelIds=None, limit=50):
         params = {"userId": "me", "maxResults": limit}
         if query is not None:
@@ -534,10 +483,7 @@ def _fetch_unseen(service):
             params["labelIds"] = labelIds
 
         out, skipped = [], []
-        resp = _execute_with_retries(
-            service.users().messages().list(**params),
-            what="messages.list",
-        )
+        resp = _execute_with_retries(service.users().messages().list(**params), what="messages.list")
         for m in resp.get("messages", []):
             msg_id = m["id"]
             thread_id = m.get("threadId")
@@ -551,30 +497,22 @@ def _fetch_unseen(service):
             except Exception as e:
                 print(f"[SKIP message] id={msg_id} reason={e}")
                 skipped.append(msg_id)
-                continue
         if skipped:
-            print(
-                f"[INFO] skipped {len(skipped)} message(s) due to transient errors: "
-                f"{skipped[:3]}{'...' if len(skipped) > 3 else ''}"
-            )
+            print(f"[INFO] skipped {len(skipped)} message(s) due to transient errors.")
         return out
 
     max_process = int(os.getenv("MAX_PROCESS", "10"))
 
-    # Pass 1: unread in INBOX
-    msgs = _pull(query=os.getenv("GMAIL_QUERY", "is:unread"),
-                 labelIds=["INBOX"], limit=max_process)
+    msgs = _pull(query=os.getenv("GMAIL_QUERY", "is:unread"), labelIds=["INBOX"], limit=max_process)
     if msgs:
         print(f"[DEBUG] pass1 INBOX is:unread -> {len(msgs)}")
         return msgs
 
-    # Pass 2: unread anywhere
     msgs = _pull(query="is:unread", labelIds=None, limit=max_process)
     if msgs:
         print(f"[DEBUG] pass2 ANY is:unread -> {len(msgs)}")
         return msgs
 
-    # Pass 3: label UNREAD
     msgs = _pull(query=None, labelIds=["UNREAD"], limit=max_process)
     if msgs:
         print(f"[DEBUG] pass3 label:UNREAD -> {len(msgs)}")
@@ -583,17 +521,26 @@ def _fetch_unseen(service):
     print("[DEBUG] no unread messages found by any strategy")
     return []
 
-'''
+
+def _mark_read(service, msg_id):
+    """Remove UNREAD label so it doesn't come back next run."""
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=msg_id,
+            body={"removeLabelIds": ["UNREAD"]}
+        ).execute()
+    except Exception as e:
+        print("[WARN] failed to mark as read:", e)
+
+
+# ----------------- Main handler -----------------
 def handle(service, conn, raw, thread_id, msg_id):
-    """
-    Process a single unread Gmail message given its raw bytes + thread_id.
-    Uses llm_agent to decide what to do (confirm / ask_missing / draft / skip).
-    """
     msg = email.message_from_bytes(raw)
     mid = msg.get("Message-ID")
     c = conn.cursor()
 
-    # skip if already processed
+    # Always skip if already processed (including feedback) to prevent loops
     if mid and c.execute("SELECT 1 FROM processed WHERE message_id=?", (mid,)).fetchone():
         return
 
@@ -601,125 +548,15 @@ def handle(service, conn, raw, thread_id, msg_id):
     body = _body(msg)
     from_email = email.utils.parseaddr(msg.get("From", ""))[1]
 
-    # skip marketing / no-reply
     if _is_no_reply(from_email, msg):
         print("[SKIP no-reply/marketing] ->", from_email)
+        _mark_read(service, msg_id)
         return
 
-    # Build thread context using thread_id (NO gmail_meta)
+    # Thread context + LLM decision
     thread_bundle = _get_thread_bundle(service, thread_id)
     thread_text = summarize_thread(thread_bundle)
 
-    # LLM structured extraction + decision
-    extract = call_llm_extract(thread_text)
-
-    # Use email's received time as reference for "today/tomorrow"
-    ref_dt = received_local_dt(msg)
-
-    plan = decide_action(extract, ref_dt)
-
-    print(
-        f"[LLM] plan={plan['action']} conf={plan['confidence']:.2f} "
-        f"date={plan['date_iso']} time={plan['time_24']} party={plan['party_size']}"
-    )
-
-    name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
-
-    if plan["action"] == "confirm":
-        body_text = _tpl_confirm(
-            name,
-            plan["date_iso"],
-            plan["time_24"],
-            str(plan["party_size"]),
-        )
-        _send(
-            service,
-            from_email,
-            f"Re: {subj} — Reservation Confirmed",
-            body_text,
-            in_reply_to=mid,
-            thread_id=thread_id,
-        )
-        print("[SENT] confirm ->", from_email)
-
-    elif plan["action"] == "ask_missing":
-        hd = bool(plan["date_iso"])
-        ht = bool(plan["time_24"])
-        hp = bool(plan["party_size"])
-        _send(
-            service,
-            from_email,
-            f"Re: {subj} — One quick detail",
-            _tpl_missing(name, hd, ht, hp),
-            in_reply_to=mid,
-            thread_id=thread_id,
-        )
-        print("[SENT] missing ->", from_email)
-
-    elif plan["action"] == "feedback":
-    # FULL AUTO FEEDBACK SYSTEM
-        sentiment, score = analyze_sentiment_with_backoff(body)
-        discount = choose_discount(sentiment, score, body)
-
-        prefix = "CARE" if sentiment == "negative" else "THANKS"
-        code = _random_code(prefix, discount)
-        persist_coupon(conn, from_email, code, discount, sentiment, score)
-
-        reply_body = generate_personalized_reply(
-            name,
-            sentiment,
-            score,
-            discount,
-            code,
-            body
-        )
-
-        _send(service, from_email, f"Re: {subj}", reply_body, in_reply_to=mid, thread_id=thread_id)
-        print(f"[SENT feedback] {sentiment}/{score} -> {discount}% code={code} to {from_email}")
-
-
-    else:
-        print("[SKIP other] ->", from_email)
-
-    # mark as processed
-    if mid:
-        c.execute(
-            "INSERT OR REPLACE INTO processed(message_id, processed_at) "
-            "VALUES (?, datetime('now'))",
-            (mid,),
-        )
-        conn.commit()
-'''
-def handle(service, conn, raw, thread_id, msg_id):
-    """
-    Process a single unread Gmail message given its raw bytes + thread_id.
-    Uses llm_agent to decide what to do.
-    """
-    msg = email.message_from_bytes(raw)
-    mid = msg.get("Message-ID")
-    c = conn.cursor()
-
-    # Skip processed ONLY for reservation/other, NOT feedback
-    if mid:
-        seen = c.execute("SELECT action FROM processed WHERE message_id=?", (mid,)).fetchone()
-        if seen:
-            if seen[0] != "feedback":   # feedback is allowed to re-run
-                return
-
-    subj = _dec(msg.get("Subject", ""))
-    body = _body(msg)
-    from_email = email.utils.parseaddr(msg.get("From", ""))[1]
-
-    # skip marketing / no-reply
-    if _is_no_reply(from_email, msg):
-        print("[SKIP no-reply/marketing] ->", from_email)
-        return
-
-    # Build thread context
-    thread_bundle = _get_thread_bundle(service, thread_id)
-    thread_text = summarize_thread(thread_bundle)
-
-    # LLM Structured extraction
     extract = call_llm_extract(thread_text)
     ref_dt = received_local_dt(msg)
     plan = decide_action(extract, ref_dt)
@@ -731,115 +568,88 @@ def handle(service, conn, raw, thread_id, msg_id):
 
     name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
 
-
-    # ===============================
-    # 1) RESERVATION CONFIRM
-    # ===============================
+    # 1) Confirm reservation
     if plan["action"] == "confirm":
         body_text = _tpl_confirm(name, plan["date_iso"], plan["time_24"], str(plan["party_size"]))
-        _send(service, from_email, f"Re: {subj} — Reservation Confirmed",
-              body_text, in_reply_to=mid, thread_id=thread_id)
+        _send(service, from_email, f"Re: {subj} — Reservation Confirmed", body_text, in_reply_to=mid, thread_id=thread_id)
         print("[SENT] confirm ->", from_email)
 
-        # mark processed
         if mid:
-            c.execute("INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                      (mid, "confirm"))
+            c.execute(
+                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                (mid, "confirm")
+            )
             conn.commit()
-            # also mark the Gmail message as READ so we don't see it again as "unread"
-        try:
-            service.users().messages().modify(
-                userId="me",
-                id=msg_id,
-                body={"removeLabelIds": ["UNREAD"]}
-            ).execute()
-        except Exception as e:
-            print("[WARN] failed to mark as read:", e)
 
+        _mark_read(service, msg_id)
         return
 
-
-    # ===============================
-    # 2) RESERVATION - ASK MISSING INFO
-    # ===============================
+    # 2) Ask missing details
     if plan["action"] == "ask_missing":
         hd = bool(plan["date_iso"])
         ht = bool(plan["time_24"])
         hp = bool(plan["party_size"])
-
-        _send(
-            service,
-            from_email,
-            f"Re: {subj} — One quick detail",
-            _tpl_missing(name, hd, ht, hp),
-            in_reply_to=mid,
-            thread_id=thread_id,
-        )
+        _send(service, from_email, f"Re: {subj} — One quick detail", _tpl_missing(name, hd, ht, hp),
+              in_reply_to=mid, thread_id=thread_id)
         print("[SENT] missing ->", from_email)
 
-        # mark processed
         if mid:
-            c.execute("INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                      (mid, "ask_missing"))
+            c.execute(
+                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                (mid, "ask_missing")
+            )
             conn.commit()
+
+        _mark_read(service, msg_id)
         return
 
-
-    # ===============================
-    # 3) FEEDBACK → FULL AUTO REPLY
-    # ===============================
+    # 3) Feedback (auto-reply with coupon)
     if plan["action"] == "feedback":
         print("[INFO] Feedback detected → Sending coupon reply")
 
-        # sentiment + score
         sentiment, score = analyze_sentiment_with_backoff(body)
-
-        # discount %
         discount = choose_discount(sentiment, score, body)
 
-        # coupon code
         prefix = "CARE" if sentiment == "negative" else "THANKS"
         code = _random_code(prefix, discount)
         persist_coupon(conn, from_email, code, discount, sentiment, score)
 
-        # generate LLM reply
-        reply_body = generate_personalized_reply(
-            name,
-            sentiment,
-            score,
-            discount,
-            code,
-            body
-        )
+        reply_body = generate_personalized_reply(name, sentiment, score, discount, code, body)
 
-        # send email
         _send(service, from_email, f"Re: {subj}", reply_body, in_reply_to=mid, thread_id=thread_id)
         print(f"[SENT feedback] {sentiment}/{score} -> {discount}% code={code} to {from_email}")
 
-        # DO NOT mark processed
+        # log feedback (for dashboard)
+        log_feedback(conn, from_email, sentiment, score, discount, code, body, reply_body)
+
+        # mark processed + read (IMPORTANT to avoid re-sending again and again)
+        if mid:
+            c.execute(
+                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                (mid, "feedback")
+            )
+            conn.commit()
+
+        _mark_read(service, msg_id)
         return
 
-
-    # ===============================
-    # 4) OTHER → SKIP
-    # ===============================
+    # 4) Skip other
     print("[SKIP other] ->", from_email)
-
     if mid:
-        c.execute("INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                  (mid, "skip"))
+        c.execute(
+            "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+            (mid, "skip")
+        )
         conn.commit()
+
+    _mark_read(service, msg_id)
 
 
 def send_pending(service, conn):
-    """
-    Send any staged drafts in the SQLite DB.
-    Use: python agent.py --send-pending
-    """
+    """Send any staged drafts in the SQLite DB."""
     c = conn.cursor()
     rows = c.execute(
-        "SELECT id,to_email,subject,body,in_reply_to "
-        "FROM drafts WHERE sent_at IS NULL ORDER BY id"
+        "SELECT id,to_email,subject,body,in_reply_to FROM drafts WHERE sent_at IS NULL ORDER BY id"
     ).fetchall()
     for did, to_email, subject, body, in_reply_to in rows:
         _send(service, to_email, subject, body, in_reply_to=in_reply_to, thread_id=None)

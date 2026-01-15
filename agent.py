@@ -20,6 +20,7 @@ Requires:
 """
 
 from __future__ import print_function
+from db_utils import ensure_schema, reserve, next_available_slots, DEFAULT_CAPACITY
 
 import os
 import re

@@ -12,6 +12,7 @@ import os
 import sqlite3
 from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
+from db_utils import ensure_schema, list_slots_for_date, count_booked, reserve, DEFAULT_CAPACITY
 
 import altair as alt
 import pandas as pd
@@ -28,9 +29,46 @@ OWNER_EMAIL = os.getenv("EMAIL_ADDRESS", "")
 LOGO_URL = os.getenv("LOGO_URL", "")
 
 # ========== DATABASE FUNCTIONS ==========
+@st.cache_data(ttl=15, show_spinner=False)
+def load_reservations(start_date: date, end_date: date) -> pd.DataFrame:
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            """SELECT * FROM reservations
+               WHERE date(slot_datetime) BETWEEN ? AND ?
+               ORDER BY slot_datetime ASC""",
+            conn,
+            params=(start_date.isoformat(), end_date.isoformat())
+        )
+        if not df.empty and "created_at" in df.columns:
+            df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+def slot_availability(conn: sqlite3.Connection, date_iso: str, capacity: int = DEFAULT_CAPACITY) -> pd.DataFrame:
+    slots = list_slots_for_date(date_iso)
+    rows = []
+    for t in slots:
+        booked = count_booked(conn, date_iso, t)
+        rows.append({
+            "time": t,
+            "booked": booked,
+            "capacity": capacity,
+            "available": max(0, capacity - booked),
+            "status": "✅ Available" if booked < capacity else "⛔ Full"
+        })
+    return pd.DataFrame(rows)
 
 def get_connection() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        ensure_schema(conn)
+    except Exception:
+        pass
+    return conn
 
 def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     query = "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
@@ -483,6 +521,7 @@ def render_hero():
     </div>
     """, unsafe_allow_html=True)
 
+
 # ========== MAIN APPLICATION ==========
 
 def main():
@@ -608,7 +647,7 @@ def main():
         st.markdown(render_metric("🌟", "Fans", str(positive)), unsafe_allow_html=True)
     
     # ========== TABS ==========
-    tab1, tab2, tab3 = st.tabs(["📊 Analytics", "📬 Inbox", "🎟️ Coupons"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Analytics", "📬 Inbox", "🎟️ Coupons", "📅 Reservations"])
     
     # ========== TAB 1: ANALYTICS ==========
     with tab1:
@@ -826,6 +865,70 @@ def main():
                 st.metric("Unique Customers", unique_customers)
         
         st.markdown('</div>', unsafe_allow_html=True)
+    # ========== TAB 4: RESERVATIONS ==========
+    with tab4:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.markdown("#### 📅 Reservations (Booking + Capacity)")
+
+        colA, colB = st.columns([0.55, 0.45])
+
+        with colA:
+            st.markdown("##### Availability")
+            day = st.date_input("Date", value=date.today(), key="res_date")
+            date_iso = day.isoformat()
+
+            conn = get_connection()
+            avail_df = slot_availability(conn, date_iso, capacity=DEFAULT_CAPACITY)
+            conn.close()
+
+            st.dataframe(avail_df, use_container_width=True, hide_index=True)
+
+        with colB:
+            st.markdown("##### Create a reservation (web)")
+            with st.form("reserve_form", clear_on_submit=True):
+                name = st.text_input("Name", placeholder="Customer name")
+                email = st.text_input("Email", placeholder="customer@email.com")
+                phone = st.text_input("Phone (optional)", placeholder="+1 ...")
+                party = st.number_input("Party size", min_value=1, max_value=50, value=2, step=1)
+                time_24 = st.selectbox("Time (30-min slots)", options=list_slots_for_date(date_iso))
+                submitted = st.form_submit_button("Confirm reservation", use_container_width=True)
+
+                if submitted:
+                    if not name or not email:
+                        st.error("Name and email are required.")
+                    else:
+                        conn = get_connection()
+                        ok, code, reason = reserve(
+                            conn,
+                            name=name.strip(),
+                            email=email.strip(),
+                            phone=phone.strip() if phone else None,
+                            party_size=int(party),
+                            date_iso=date_iso,
+                            time_24=time_24,
+                            source="web",
+                            capacity=DEFAULT_CAPACITY
+                        )
+                        conn.close()
+
+                        if ok:
+                            st.success(f"Booked! Confirmation: {code}")
+                        else:
+                            st.error(reason or "Could not book that slot.")
+
+        st.markdown("---")
+        st.markdown("##### Upcoming / Recent reservations")
+        r_start = st.date_input("From", value=date.today() - timedelta(days=3), key="res_from")
+        r_end = st.date_input("To", value=date.today() + timedelta(days=14), key="res_to")
+
+        res_df = load_reservations(r_start, r_end)
+        if res_df.empty:
+            st.info("No reservations in this range yet.")
+        else:
+            st.dataframe(res_df, use_container_width=True, hide_index=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
     
     # ========== FOOTER ==========
     st.markdown("")

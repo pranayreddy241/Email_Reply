@@ -193,6 +193,28 @@ def _tpl_missing(name, hd, ht, hp):
     L += ["", "Best,", RESTAURANT_NAME]
     return "\n".join(L)
 
+def _tpl_slot_full(name, d, requested_t, alternatives):
+    alt_lines = []
+    if alternatives:
+        alt_lines = ["Here are the next available times:", *[f"• {t}" for t in alternatives]]
+    else:
+        alt_lines = ["Unfortunately, we are fully booked for that date. Could you share a different date or time?"]
+
+    L = [
+        f"Hi{(' ' + name) if name else ''},",
+        "",
+        f"Thanks for reaching out! We’re currently fully booked at {RESTAURANT_NAME} for:",
+        f"• Date: {d}",
+        f"• Time: {requested_t}",
+        "",
+        *alt_lines,
+        "",
+        "Reply with your preferred option and party size, and we’ll confirm it right away.",
+        "",
+        "Best,",
+        RESTAURANT_NAME
+    ]
+    return "\n".join([x for x in L if x])
 
 # ----------------- Feedback helpers (sentiment + coupons) -----------------
 def analyze_sentiment_with_backoff(message_text: str):
@@ -423,6 +445,7 @@ def _db():
     """)
 
     conn.commit()
+    ensure_schema(conn)
     return conn
 
 
@@ -568,7 +591,66 @@ def handle(service, conn, raw, thread_id, msg_id):
     )
 
     name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
+  # 1) Confirm reservation (NOW capacity-aware)
+    if plan["action"] == "confirm":
+        ok, code, reason = reserve(
+            conn,
+            name=name,
+            email=from_email,
+            phone=None,
+            party_size=plan["party_size"],
+            date_iso=plan["date_iso"],
+            time_24=plan["time_24"],
+            source="email",
+            capacity=DEFAULT_CAPACITY
+        )
 
+        if not ok:
+            alternatives = next_available_slots(conn, plan["date_iso"], capacity=DEFAULT_CAPACITY, limit=3)
+            body_text = _tpl_slot_full(name, plan["date_iso"], plan["time_24"], alternatives)
+
+            _send(
+                service,
+                from_email,
+                f"Re: {subj} — Time Unavailable",
+                body_text,
+                in_reply_to=mid,
+                thread_id=thread_id
+            )
+            print("[SENT] slot full ->", from_email)
+
+            if mid:
+                c.execute(
+                    "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                    (mid, "slot_full")
+                )
+                conn.commit()
+
+            _mark_read(service, msg_id)
+            return
+
+        body_text = _tpl_confirm(name, plan["date_iso"], plan["time_24"], str(plan["party_size"]), code)
+
+        _send(
+            service,
+            from_email,
+            f"Re: {subj} — Reservation Confirmed",
+            body_text,
+            in_reply_to=mid,
+            thread_id=thread_id
+        )
+        print("[SENT] confirm ->", from_email)
+
+        if mid:
+            c.execute(
+                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
+                (mid, "confirm")
+            )
+            conn.commit()
+
+        _mark_read(service, msg_id)
+        return
+'''
     # 1) Confirm reservation
     if plan["action"] == "confirm":
         body_text = _tpl_confirm(name, plan["date_iso"], plan["time_24"], str(plan["party_size"]))
@@ -584,7 +666,7 @@ def handle(service, conn, raw, thread_id, msg_id):
 
         _mark_read(service, msg_id)
         return
-
+'''
     # 2) Ask missing details
     if plan["action"] == "ask_missing":
         hd = bool(plan["date_iso"])

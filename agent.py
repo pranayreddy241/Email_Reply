@@ -3,7 +3,7 @@
 Restaurant Email Agent (Gmail API / OAuth + LLM)
 - Fetch unread messages via Gmail API
 - Use llm_agent.py to decide action: confirm / ask_missing / feedback / skip
-- Auto-reply reservations
+- Auto-reply reservations (now capacity-aware + stores reservations)
 - Auto-reply feedback with sentiment + coupon + personalized reply
 - Prevent double-processing using SQLite `processed` table (Message-ID)
 - Log feedback emails + replies in `feedback_log`
@@ -20,7 +20,6 @@ Requires:
 """
 
 from __future__ import print_function
-from db_utils import ensure_schema, reserve, next_available_slots, DEFAULT_CAPACITY
 
 import os
 import re
@@ -32,7 +31,6 @@ import random
 import string
 from email.message import EmailMessage
 from email.header import decode_header, make_header
-
 from dotenv import load_dotenv
 
 from googleapiclient.errors import HttpError
@@ -40,6 +38,9 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+# NEW: Reservations + schema helpers
+from db_utils import ensure_schema, reserve, next_available_slots, DEFAULT_CAPACITY
 
 # LLM helper module (your file)
 from llm_agent import summarize_thread, call_llm_extract, decide_action, received_local_dt
@@ -109,8 +110,8 @@ def _body(msg):
             if ctype == "text/html" and "attachment" not in disp:
                 cs = part.get_content_charset() or "utf-8"
                 html = part.get_payload(decode=True).decode(cs, errors="replace")
-                text = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
-                return re.sub(r'<[^>]+>', ' ', text)
+                text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+                return re.sub(r"<[^>]+>", " ", text)
     else:
         cs = msg.get_content_charset() or "utf-8"
         raw = msg.get_payload(decode=True)
@@ -118,8 +119,8 @@ def _body(msg):
             return msg.get_payload()
         text = raw.decode(cs, errors="replace")
         if msg.get_content_type() == "text/html":
-            text = re.sub(r'<br\s*/?>', '\n', text, flags=re.I)
-            text = re.sub(r'<[^>]+>', ' ', text)
+            text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+            text = re.sub(r"<[^>]+>", " ", text)
         return text
     return ""
 
@@ -164,7 +165,7 @@ def _execute_with_retries(req, retries=5, base=1.0, cap=30.0, what="request"):
     raise RuntimeError(f"{what} failed after {retries} retries")
 
 
-def _tpl_confirm(name, d, t, p):
+def _tpl_confirm(name, d, t, p, confirmation_code=None):
     L = [
         f"Hi{(' ' + name) if name else ''},",
         "",
@@ -173,10 +174,14 @@ def _tpl_confirm(name, d, t, p):
         f"• Time: {t}",
         f"• Party size: {p}",
     ]
+    if confirmation_code:
+        L.append(f"• Confirmation: {confirmation_code}")
+
     if RESERVATION_LINK:
         L.append(f"Modify/cancel: {RESERVATION_LINK}")
     if RESERVATION_PHONE:
         L.append(f"Phone: {RESERVATION_PHONE}")
+
     L += ["", "We look forward to hosting you!", f"— {RESTAURANT_NAME}"]
     return "\n".join(L)
 
@@ -193,8 +198,8 @@ def _tpl_missing(name, hd, ht, hp):
     L += ["", "Best,", RESTAURANT_NAME]
     return "\n".join(L)
 
+
 def _tpl_slot_full(name, d, requested_t, alternatives):
-    alt_lines = []
     if alternatives:
         alt_lines = ["Here are the next available times:", *[f"• {t}" for t in alternatives]]
     else:
@@ -212,9 +217,10 @@ def _tpl_slot_full(name, d, requested_t, alternatives):
         "Reply with your preferred option and party size, and we’ll confirm it right away.",
         "",
         "Best,",
-        RESTAURANT_NAME
+        RESTAURANT_NAME,
     ]
     return "\n".join([x for x in L if x])
+
 
 # ----------------- Feedback helpers (sentiment + coupons) -----------------
 def analyze_sentiment_with_backoff(message_text: str):
@@ -246,7 +252,7 @@ def analyze_sentiment_with_backoff(message_text: str):
                         model=model,
                         temperature=0.2,
                         messages=[{"role": "user", "content": prompt}],
-                        max_tokens=60
+                        max_tokens=60,
                     )
                     txt = resp.choices[0].message.content.strip()
                     obj = __import__("json").loads(txt)
@@ -271,11 +277,16 @@ def analyze_sentiment_with_backoff(message_text: str):
         "amazing", "great", "excellent", "love", "loved", "fantastic",
         "wonderful", "perfect", "delicious", "best"
     ])
-    if neg_hits >= 3: return "negative", 5
-    if neg_hits == 2: return "negative", 4
-    if neg_hits == 1: return "negative", 3
-    if pos_hits >= 2: return "positive", 1
-    if pos_hits == 1: return "positive", 2
+    if neg_hits >= 3:
+        return "negative", 5
+    if neg_hits == 2:
+        return "negative", 4
+    if neg_hits == 1:
+        return "negative", 3
+    if pos_hits >= 2:
+        return "positive", 1
+    if pos_hits == 1:
+        return "positive", 2
     return "neutral", 3
 
 
@@ -302,7 +313,7 @@ def persist_coupon(conn, email_addr: str, code: str, discount: int, sentiment: s
     c = conn.cursor()
     c.execute(
         "INSERT OR IGNORE INTO coupons(email, code, discount, sentiment, score) VALUES (?,?,?,?,?)",
-        (email_addr, code, discount, sentiment, score)
+        (email_addr, code, discount, sentiment, score),
     )
     conn.commit()
 
@@ -368,21 +379,21 @@ def generate_personalized_reply(name: str, sentiment: str, score: int,
             f"Hi{(' ' + name) if name else ''},\n\n"
             f"Thank you for the wonderful note—guests like you make our day. "
             f"As a small thank-you, here’s {discount}% off next time (code: {code}). "
-            f"We can’t wait to welcome you back.\n\n— {RESTAURANT_NAME}"
+            f"We can’t wait to welcome you back.\n\n{RESTAURANT_NAME}"
         )
     if sentiment == "neutral":
         return (
             f"Hi{(' ' + name) if name else ''},\n\n"
             f"Thanks for sharing your thoughts—your feedback helps us improve. "
             f"Please accept {discount}% off your next visit (code: {code}); we’d love another chance to impress.\n\n"
-            f"— {RESTAURANT_NAME}"
+            f"{RESTAURANT_NAME}"
         )
     opener = "We’re truly sorry" if score >= 4 else "We’re sorry"
     return (
         f"Hi{(' ' + name) if name else ''},\n\n"
         f"{opener} that your experience fell short. You matter to us, and we’ve noted your concerns with the team. "
         f"Please allow us to make it right—here’s {discount}% off for your next visit (code: {code}). "
-        f"We appreciate the chance to earn back your trust.\n\n— {RESTAURANT_NAME}"
+        f"We appreciate the chance to earn back your trust.\n\n{RESTAURANT_NAME}"
     )
 
 
@@ -445,7 +456,10 @@ def _db():
     """)
 
     conn.commit()
+
+    # NEW: ensure reservations + review scaffolding
     ensure_schema(conn)
+
     return conn
 
 
@@ -469,7 +483,7 @@ def _get_thread_bundle(service, thread_id):
 
         frm = hdr("From") or ""
         subj = hdr("Subject") or ""
-        date = hdr("Date") or ""
+        dt = hdr("Date") or ""
         body = ""
 
         def walk(parts):
@@ -490,7 +504,7 @@ def _get_thread_bundle(service, thread_id):
         walk(payload.get("parts"))
         if not body:
             body = "(no text body)"
-        items.append({"from": frm, "date": date, "subject": subj, "body": body})
+        items.append({"from": frm, "date": dt, "subject": subj, "body": body})
     return items
 
 
@@ -552,7 +566,7 @@ def _mark_read(service, msg_id):
         service.users().messages().modify(
             userId="me",
             id=msg_id,
-            body={"removeLabelIds": ["UNREAD"]}
+            body={"removeLabelIds": ["UNREAD"]},
         ).execute()
     except Exception as e:
         print("[WARN] failed to mark as read:", e)
@@ -564,7 +578,7 @@ def handle(service, conn, raw, thread_id, msg_id):
     mid = msg.get("Message-ID")
     c = conn.cursor()
 
-    # Always skip if already processed (including feedback) to prevent loops
+    # Always skip if already processed to prevent loops
     if mid and c.execute("SELECT 1 FROM processed WHERE message_id=?", (mid,)).fetchone():
         return
 
@@ -586,28 +600,29 @@ def handle(service, conn, raw, thread_id, msg_id):
     plan = decide_action(extract, ref_dt)
 
     print(
-        f"[LLM] plan={plan['action']} conf={plan['confidence']:.2f} "
-        f"date={plan['date_iso']} time={plan['time_24']} party={plan['party_size']}"
+        f"[LLM] plan={plan.get('action')} conf={plan.get('confidence', 0):.2f} "
+        f"date={plan.get('date_iso')} time={plan.get('time_24')} party={plan.get('party_size')}"
     )
 
     name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
-  # 1) Confirm reservation (NOW capacity-aware)
-    if plan["action"] == "confirm":
+
+    # 1) Confirm reservation (capacity-aware)
+    if plan.get("action") == "confirm":
         ok, code, reason = reserve(
             conn,
             name=name,
             email=from_email,
             phone=None,
-            party_size=plan["party_size"],
-            date_iso=plan["date_iso"],
-            time_24=plan["time_24"],
+            party_size=plan.get("party_size"),
+            date_iso=plan.get("date_iso"),
+            time_24=plan.get("time_24"),
             source="email",
-            capacity=DEFAULT_CAPACITY
+            capacity=DEFAULT_CAPACITY,
         )
 
         if not ok:
-            alternatives = next_available_slots(conn, plan["date_iso"], capacity=DEFAULT_CAPACITY, limit=3)
-            body_text = _tpl_slot_full(name, plan["date_iso"], plan["time_24"], alternatives)
+            alternatives = next_available_slots(conn, plan.get("date_iso"), capacity=DEFAULT_CAPACITY, limit=3)
+            body_text = _tpl_slot_full(name, plan.get("date_iso"), plan.get("time_24"), alternatives)
 
             _send(
                 service,
@@ -615,21 +630,21 @@ def handle(service, conn, raw, thread_id, msg_id):
                 f"Re: {subj} — Time Unavailable",
                 body_text,
                 in_reply_to=mid,
-                thread_id=thread_id
+                thread_id=thread_id,
             )
             print("[SENT] slot full ->", from_email)
 
             if mid:
                 c.execute(
                     "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                    (mid, "slot_full")
+                    (mid, "slot_full"),
                 )
                 conn.commit()
 
             _mark_read(service, msg_id)
             return
 
-        body_text = _tpl_confirm(name, plan["date_iso"], plan["time_24"], str(plan["party_size"]), code)
+        body_text = _tpl_confirm(name, plan.get("date_iso"), plan.get("time_24"), str(plan.get("party_size")), code)
 
         _send(
             service,
@@ -637,49 +652,39 @@ def handle(service, conn, raw, thread_id, msg_id):
             f"Re: {subj} — Reservation Confirmed",
             body_text,
             in_reply_to=mid,
-            thread_id=thread_id
+            thread_id=thread_id,
         )
         print("[SENT] confirm ->", from_email)
 
         if mid:
             c.execute(
                 "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                (mid, "confirm")
+                (mid, "confirm"),
             )
             conn.commit()
 
         _mark_read(service, msg_id)
         return
-'''
-    # 1) Confirm reservation
-    if plan["action"] == "confirm":
-        body_text = _tpl_confirm(name, plan["date_iso"], plan["time_24"], str(plan["party_size"]))
-        _send(service, from_email, f"Re: {subj} — Reservation Confirmed", body_text, in_reply_to=mid, thread_id=thread_id)
-        print("[SENT] confirm ->", from_email)
 
-        if mid:
-            c.execute(
-                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                (mid, "confirm")
-            )
-            conn.commit()
-
-        _mark_read(service, msg_id)
-        return
-'''
     # 2) Ask missing details
-    if plan["action"] == "ask_missing":
-        hd = bool(plan["date_iso"])
-        ht = bool(plan["time_24"])
-        hp = bool(plan["party_size"])
-        _send(service, from_email, f"Re: {subj} — One quick detail", _tpl_missing(name, hd, ht, hp),
-              in_reply_to=mid, thread_id=thread_id)
+    if plan.get("action") == "ask_missing":
+        hd = bool(plan.get("date_iso"))
+        ht = bool(plan.get("time_24"))
+        hp = bool(plan.get("party_size"))
+        _send(
+            service,
+            from_email,
+            f"Re: {subj} — One quick detail",
+            _tpl_missing(name, hd, ht, hp),
+            in_reply_to=mid,
+            thread_id=thread_id,
+        )
         print("[SENT] missing ->", from_email)
 
         if mid:
             c.execute(
                 "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                (mid, "ask_missing")
+                (mid, "ask_missing"),
             )
             conn.commit()
 
@@ -687,7 +692,7 @@ def handle(service, conn, raw, thread_id, msg_id):
         return
 
     # 3) Feedback (auto-reply with coupon)
-    if plan["action"] == "feedback":
+    if plan.get("action") == "feedback":
         print("[INFO] Feedback detected → Sending coupon reply")
 
         sentiment, score = analyze_sentiment_with_backoff(body)
@@ -705,11 +710,11 @@ def handle(service, conn, raw, thread_id, msg_id):
         # log feedback (for dashboard)
         log_feedback(conn, from_email, sentiment, score, discount, code, body, reply_body)
 
-        # mark processed + read (IMPORTANT to avoid re-sending again and again)
+        # mark processed + read
         if mid:
             c.execute(
                 "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                (mid, "feedback")
+                (mid, "feedback"),
             )
             conn.commit()
 
@@ -721,7 +726,7 @@ def handle(service, conn, raw, thread_id, msg_id):
     if mid:
         c.execute(
             "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-            (mid, "skip")
+            (mid, "skip"),
         )
         conn.commit()
 

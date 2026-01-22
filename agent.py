@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
 """
 Agent (Postgres) + Gmail + LLM
-Adds:
-- Reservation updates: if user asks to change/update/reschedule, we cancel their latest confirmed res and book new one
-- Phone capture from email body (best-effort)
+- Fetch unread messages via Gmail API
+- Decide action via llm_agent.py: confirm / ask_missing / feedback / skip
+- Capacity-aware reservations stored in Postgres
+- Reservation updates: if email asks to change/update, cancel latest confirmed reservation for that email and book new one
+- Feedback: sentiment + coupon issuance + log
+- Dedupe via processed table (message_id primary key)
+- Mark email as READ after processing
+- Writes system_status heartbeats for dashboard
+
+ENV:
+  DATABASE_URL=postgresql://...
+  OPENAI_API_KEY=...
+  RESTAURANT_NAME=...
+  DEFAULT_CAPACITY=10
+  GMAIL_QUERY=is:unread
+  MAX_PROCESS=10
+  GMAIL_TOKEN_JSON=<contents of token.json> (optional bootstrap on Render)
 """
 
 from __future__ import print_function
 
 import os
 import re
-import email
-import base64
 import time
+import base64
 import random
 import string
+import email
 from email.message import EmailMessage
 from email.header import decode_header, make_header
+
 from dotenv import load_dotenv
 
 from googleapiclient.errors import HttpError
@@ -26,18 +41,33 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from db_pg import get_pg_conn, ensure_schema_pg
-from db_utils import reserve, next_available_slots, cancel_latest_reservation, DEFAULT_CAPACITY
-
+from db_utils import (
+    reserve,
+    next_available_slots,
+    cancel_latest_reservation,
+    DEFAULT_CAPACITY,
+)
 from llm_agent import summarize_thread, call_llm_extract, decide_action, received_local_dt
 
 load_dotenv()
 
+# ----------------- Config -----------------
 RESTAURANT_NAME = os.getenv("RESTAURANT_NAME", "My Restaurant")
 RESERVATION_PHONE = os.getenv("RESERVATION_PHONE", "")
 RESERVATION_LINK = os.getenv("RESERVATION_LINK", "")
+CAPACITY = int(os.getenv("DEFAULT_CAPACITY", str(DEFAULT_CAPACITY)))
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
-# ----------------- helpers -----------------
+
+# ----------------- Helpers -----------------
+def _bootstrap_token_json():
+    """If running on Render, you can store token.json content in env var GMAIL_TOKEN_JSON."""
+    token_env = os.getenv("GMAIL_TOKEN_JSON")
+    if token_env and not os.path.exists("token.json"):
+        with open("token.json", "w") as f:
+            f.write(token_env)
+
+
 def _is_no_reply(addr, msg):
     a = (addr or "").lower()
     if any(x in a for x in ["no-reply", "noreply", "notifications", "mailer-daemon"]):
@@ -46,12 +76,79 @@ def _is_no_reply(addr, msg):
         return True
     return False
 
-def _bootstrap_token_json():
-    token_env = os.getenv("GMAIL_TOKEN_JSON")
-    if token_env and not os.path.exists("token.json"):
-        with open("token.json", "w") as f:
-            f.write(token_env)
 
+def _dec(s):
+    if not s:
+        return ""
+    try:
+        return str(make_header(decode_header(s)))
+    except Exception:
+        return s
+
+
+def _body(msg):
+    """Extract best-effort text body from email.message.Message."""
+    if msg.is_multipart():
+        # Prefer text/plain
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = str(part.get("Content-Disposition") or "")
+            if ctype == "text/plain" and "attachment" not in disp:
+                cs = part.get_content_charset() or "utf-8"
+                return part.get_payload(decode=True).decode(cs, errors="replace")
+        # Fallback: text/html stripped
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = str(part.get("Content-Disposition") or "")
+            if ctype == "text/html" and "attachment" not in disp:
+                cs = part.get_content_charset() or "utf-8"
+                html = part.get_payload(decode=True).decode(cs, errors="replace")
+                text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+                return re.sub(r"<[^>]+>", " ", text)
+    else:
+        cs = msg.get_content_charset() or "utf-8"
+        raw = msg.get_payload(decode=True)
+        if raw is None:
+            return msg.get_payload() or ""
+        text = raw.decode(cs, errors="replace")
+        if msg.get_content_type() == "text/html":
+            text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+            text = re.sub(r"<[^>]+>", " ", text)
+        return text
+    return ""
+
+
+def extract_phone_best_effort(text: str):
+    """Loose phone extractor: grabs +digits or (xxx) xxx-xxxx style; requires >=9 digits."""
+    if not text:
+        return None
+    m = re.search(r"(\+?\d[\d\-\(\)\s]{8,}\d)", text)
+    if not m:
+        return None
+    raw = m.group(1)
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 9:
+        return None
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def detect_update_request(subject: str, body: str) -> bool:
+    text = (subject + "\n" + body).lower()
+    keywords = [
+        "update my reservation", "change my reservation", "modify my reservation",
+        "reschedule", "change the time", "change the date", "move the reservation",
+        "need to change", "can we change", "instead of", "correction", "correct my reservation",
+        "change reservation", "update reservation",
+    ]
+    return any(k in text for k in keywords)
+
+
+def _random_code(prefix: str, pct: int) -> str:
+    tail = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"{prefix}{pct}-{tail}"
+
+
+# ----------------- Gmail -----------------
 def get_gmail_service():
     _bootstrap_token_json()
 
@@ -63,6 +160,8 @@ def get_gmail_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            if not os.path.exists("client_secret.json"):
+                raise RuntimeError("client_secret.json missing. Put it in project root.")
             flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
             creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
@@ -70,41 +169,6 @@ def get_gmail_service():
 
     return build("gmail", "v1", credentials=creds)
 
-def _dec(s):
-    if not s:
-        return ""
-    try:
-        return str(make_header(decode_header(s)))
-    except Exception:
-        return s
-
-def _body(msg):
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = str(part.get("Content-Disposition"))
-            if ctype == "text/plain" and "attachment" not in disp:
-                cs = part.get_content_charset() or "utf-8"
-                return part.get_payload(decode=True).decode(cs, errors="replace")
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = str(part.get("Content-Disposition"))
-            if ctype == "text/html" and "attachment" not in disp:
-                cs = part.get_content_charset() or "utf-8"
-                html = part.get_payload(decode=True).decode(cs, errors="replace")
-                text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-                return re.sub(r"<[^>]+>", " ", text)
-    else:
-        cs = msg.get_content_charset() or "utf-8"
-        raw = msg.get_payload(decode=True)
-        if raw is None:
-            return msg.get_payload()
-        text = raw.decode(cs, errors="replace")
-        if msg.get_content_type() == "text/html":
-            text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
-            text = re.sub(r"<[^>]+>", " ", text)
-        return text
-    return ""
 
 def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
     m = EmailMessage()
@@ -123,66 +187,43 @@ def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
         payload["threadId"] = thread_id
     return service.users().messages().send(userId="me", body=payload).execute()
 
+
 def _mark_read(service, msg_id):
     try:
         service.users().messages().modify(
             userId="me",
             id=msg_id,
-            body={"removeLabelIds": ["UNREAD"]}
+            body={"removeLabelIds": ["UNREAD"]},
         ).execute()
     except Exception as e:
         print("[WARN] failed to mark as read:", e)
 
-def _db():
-    conn = get_pg_conn()
-    ensure_schema_pg(conn)
-    return conn
 
-def _status_set(conn, key: str, value: str):
-    with conn.cursor() as c:
-        c.execute(
-            """INSERT INTO system_status(key, value, updated_at)
-               VALUES (%s,%s,NOW())
-               ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()""",
-            (key, value)
-        )
-    conn.commit()
+def _execute_with_retries(req, retries=5, base=1.0, cap=30.0, what="request"):
+    for attempt in range(retries):
+        try:
+            return req.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in (500, 502, 503, 504):
+                delay = min(cap, base * (2 ** attempt) + random.random())
+                print(f"[RETRY] {what} {status}, retry in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            raise
+        except Exception as e:
+            delay = min(cap, base * (2 ** attempt) + random.random())
+            print(f"[RETRY] {what} exception {e!r}, retry in {delay:.1f}s")
+            time.sleep(delay)
+            continue
+    raise RuntimeError(f"{what} failed after {retries} retries")
 
-def detect_update_request(subject: str, body: str) -> bool:
-    """
-    Lightweight heuristic: treat as update if they mention change/update/reschedule/correct etc.
-    (LLM can later classify this explicitly.)
-    """
-    text = f"{subject}\n{body}".lower()
-    keywords = [
-        "update my reservation", "change my reservation", "modify my reservation", "reschedule",
-        "change the time", "change the date", "move the reservation", "can we move",
-        "can we change", "need to change", "instead of", "correction", "correct my reservation"
-    ]
-    return any(k in text for k in keywords)
-
-def extract_phone_best_effort(text: str) -> str | None:
-    """
-    Extract a phone-like string from email body.
-    Supports US-ish patterns and general digits.
-    """
-    if not text:
-        return None
-    # common patterns
-    m = re.search(r"(\+?\d[\d\-\(\)\s]{8,}\d)", text)
-    if not m:
-        return None
-    raw = m.group(1)
-    # normalize spaces
-    cleaned = re.sub(r"\s+", " ", raw).strip()
-    # avoid matching order numbers etc by requiring at least 9 digits
-    digits = re.sub(r"\D", "", cleaned)
-    if len(digits) < 9:
-        return None
-    return cleaned
 
 def _get_thread_bundle(service, thread_id):
-    data = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    data = _execute_with_retries(
+        service.users().threads().get(userId="me", id=thread_id, format="full"),
+        what="threads.get",
+    )
     items = []
     for part in data.get("messages", [])[-4:]:
         payload = part.get("payload", {})
@@ -190,15 +231,16 @@ def _get_thread_bundle(service, thread_id):
 
         def hdr(name):
             for h in headers:
-                if h.get("name", "").lower() == name.lower():
-                    return h.get("value", "")
+                if (h.get("name") or "").lower() == name.lower():
+                    return h.get("value", "") or ""
             return ""
 
-        frm = hdr("From") or ""
-        subj = hdr("Subject") or ""
-        dt = hdr("Date") or ""
-        body = ""
+        frm = hdr("From")
+        subj = hdr("Subject")
+        dt = hdr("Date")
 
+        # best-effort plain text extraction from Gmail payload
+        body = ""
         def walk(parts):
             nonlocal body
             for p in parts or []:
@@ -216,25 +258,29 @@ def _get_thread_bundle(service, thread_id):
         items.append({"from": frm, "date": dt, "subject": subj, "body": body})
     return items
 
+
 def _fetch_unseen(service):
     max_process = int(os.getenv("MAX_PROCESS", "10"))
-    resp = service.users().messages().list(
-        userId="me",
-        q=os.getenv("GMAIL_QUERY", "is:unread"),
-        labelIds=["INBOX"],
-        maxResults=max_process
-    ).execute()
+    query = os.getenv("GMAIL_QUERY", "is:unread")
 
+    resp = _execute_with_retries(
+        service.users().messages().list(userId="me", q=query, labelIds=["INBOX"], maxResults=max_process),
+        what="messages.list",
+    )
     out = []
-    for m in resp.get("messages", []):
+    for m in resp.get("messages", []) or []:
         msg_id = m["id"]
         thread_id = m.get("threadId")
-        raw_resp = service.users().messages().get(userId="me", id=msg_id, format="raw").execute()
+        raw_resp = _execute_with_retries(
+            service.users().messages().get(userId="me", id=msg_id, format="raw"),
+            what="messages.get(raw)",
+        )
         raw_bytes = base64.urlsafe_b64decode(raw_resp["raw"])
         out.append((msg_id, thread_id, raw_bytes))
     return out
 
-# ----------------- templates -----------------
+
+# ----------------- Templates -----------------
 def _tpl_confirm(name, d, t, p, confirmation_code=None, updated=False):
     head = "Your reservation is updated ✅" if updated else "Your reservation is confirmed ✅"
     L = [
@@ -254,6 +300,7 @@ def _tpl_confirm(name, d, t, p, confirmation_code=None, updated=False):
     L += ["", "We look forward to hosting you!", f"— {RESTAURANT_NAME}"]
     return "\n".join(L)
 
+
 def _tpl_missing(name, hd, ht, hp):
     miss = [x for x, v in {"date": hd, "time": ht, "party size": hp}.items() if not v]
     L = [
@@ -265,6 +312,7 @@ def _tpl_missing(name, hd, ht, hp):
         L.append(f"You can also book directly here: {RESERVATION_LINK}")
     L += ["", "Best,", RESTAURANT_NAME]
     return "\n".join(L)
+
 
 def _tpl_slot_full(name, d, requested_t, alternatives):
     if alternatives:
@@ -283,73 +331,35 @@ def _tpl_slot_full(name, d, requested_t, alternatives):
         "Reply with your preferred option and party size, and we’ll confirm it right away.",
         "",
         "Best,",
-        RESTAURANT_NAME
+        RESTAURANT_NAME,
     ]
     return "\n".join([x for x in L if x])
 
-# ----------------- sentiment + coupons (same as before) -----------------
-def analyze_sentiment_with_backoff(message_text: str):
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    if api_key:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
-        except Exception:
-            client = None
-
-        if client:
-            for attempt in range(4):
-                try:
-                    prompt = (
-                        "Return strict JSON: {\"sentiment\":\"positive|neutral|negative\",\"score\":1-5}.\n"
-                        "1 very happy, 3 neutral, 5 extremely upset.\n\n"
-                        f"Message:\n{message_text}"
-                    )
-                    resp = client.chat.completions.create(
-                        model=model,
-                        temperature=0.2,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=80
-                    )
-                    txt = resp.choices[0].message.content.strip()
-                    obj = __import__("json").loads(txt)
-                    s = str(obj.get("sentiment", "neutral")).lower()
-                    sc = int(obj.get("score", 3))
-                    sc = max(1, min(5, sc))
-                    if s not in {"positive", "neutral", "negative"}:
-                        s = "neutral"
-                    return s, sc
-                except Exception:
-                    time.sleep(2 ** attempt)
-
-    t = (message_text or "").lower()
-    neg_hits = sum(w in t for w in ["awful","terrible","horrible","disgusting","cold","late","rude","bad","worst","refund","angry","disappointed"])
-    pos_hits = sum(w in t for w in ["amazing","great","excellent","love","loved","fantastic","wonderful","perfect","delicious","best"])
-    if neg_hits >= 3: return "negative", 5
-    if neg_hits == 2: return "negative", 4
-    if neg_hits == 1: return "negative", 3
-    if pos_hits >= 2: return "positive", 1
-    if pos_hits == 1: return "positive", 2
+# ----------------- Feedback (stable minimal) -----------------
+def analyze_sentiment_simple(text: str):
+    t = (text or "").lower()
+    neg_hits = sum(w in t for w in ["awful", "terrible", "horrible", "disgusting", "cold", "late", "rude", "worst", "refund", "angry", "disappointed"])
+    pos_hits = sum(w in t for w in ["amazing", "great", "excellent", "love", "fantastic", "wonderful", "perfect", "delicious", "best"])
+    if neg_hits >= 2:
+        return "negative", 4
+    if neg_hits == 1:
+        return "negative", 3
+    if pos_hits >= 2:
+        return "positive", 1
+    if pos_hits == 1:
+        return "positive", 2
     return "neutral", 3
 
-def choose_discount(sentiment: str, score: int, message_text: str) -> int:
-    text = (message_text or "").lower()
+
+def choose_discount(sentiment: str, score: int) -> int:
     if sentiment == "positive":
-        enthusiastic = any(w in text for w in ["love","loved","amazing","incredible","fantastic","perfect","best"])
-        return 10 if enthusiastic else 5
+        return 10 if score == 1 else 5
     if sentiment == "neutral":
         return 15
-    mapping = {3: 15, 4: 25, 5: 30}
-    disc = mapping.get(score, 15)
-    if score == 5 and any(w in text for w in ["worst","never again","refund","disgusting","unacceptable","furious"]):
-        disc = 40
-    return min(disc, 40)
+    # negative
+    return 25 if score >= 4 else 15
 
-def _random_code(prefix: str, pct: int) -> str:
-    tail = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
-    return f"{prefix}{pct}-{tail}"
 
 def persist_coupon(conn, email_addr: str, code: str, discount: int, sentiment: str, score: int):
     with conn.cursor() as c:
@@ -357,59 +367,101 @@ def persist_coupon(conn, email_addr: str, code: str, discount: int, sentiment: s
             """INSERT INTO coupons(email, code, discount, sentiment, score)
                VALUES (%s,%s,%s,%s,%s)
                ON CONFLICT (code) DO NOTHING""",
-            (email_addr, code, discount, sentiment, score)
+            (email_addr, code, discount, sentiment, score),
         )
     conn.commit()
 
-def log_feedback(conn, email_addr: str, sentiment: str, score: int, discount: int,
-                 code: str, original_text: str, reply_text: str):
+
+def log_feedback(conn, email_addr: str, sentiment: str, score: int, discount: int, code: str, original_text: str, reply_text: str):
     with conn.cursor() as c:
-        c.execute("""
-            INSERT INTO feedback_log(email, sentiment, score, discount, code, original_text, reply_text)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, (email_addr, sentiment, score, discount, code, original_text, reply_text))
+        c.execute(
+            """INSERT INTO feedback_log(email, sentiment, score, discount, code, original_text, reply_text)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (email_addr, sentiment, score, discount, code, original_text, reply_text),
+        )
     conn.commit()
 
-def generate_personalized_reply(name: str, sentiment: str, score: int,
-                                discount: int, code: str, message_text: str) -> str:
-    # keep simple fallback (you can re-add full OpenAI writer later)
+
+def generate_feedback_reply(name: str, sentiment: str, discount: int, code: str):
     if sentiment == "positive":
         return (
             f"Hi{(' ' + name) if name else ''},\n\n"
-            f"Thank you for the kind note! As a small thank-you, here’s {discount}% off next time (code: {code}).\n\n"
-            f"{RESTAURANT_NAME}"
+            f"Thank you for the kind note — it means a lot to our team.\n"
+            f"As a thank you, here’s {discount}% off next time: {code}\n\n"
+            f"— {RESTAURANT_NAME}"
         )
     if sentiment == "neutral":
         return (
             f"Hi{(' ' + name) if name else ''},\n\n"
-            f"Thanks for sharing this—your feedback helps us improve. Here’s {discount}% off your next visit (code: {code}).\n\n"
-            f"{RESTAURANT_NAME}"
+            f"Thanks for sharing your feedback — we’re always improving.\n"
+            f"Here’s {discount}% off your next visit: {code}\n\n"
+            f"— {RESTAURANT_NAME}"
         )
-    opener = "We’re truly sorry" if score >= 4 else "We’re sorry"
     return (
         f"Hi{(' ' + name) if name else ''},\n\n"
-        f"{opener} your experience fell short. We’d like to make it right—here’s {discount}% off (code: {code}).\n\n"
-        f"{RESTAURANT_NAME}"
+        f"We’re sorry your experience fell short. We’d like to make it right.\n"
+        f"Please accept {discount}% off your next visit: {code}\n\n"
+        f"— {RESTAURANT_NAME}"
     )
 
-# ----------------- main email handler -----------------
-def handle(service, conn, raw, thread_id, msg_id):
-    msg = email.message_from_bytes(raw)
-    mid = msg.get("Message-ID")
+
+# ----------------- Postgres status + dedupe -----------------
+def _status_set(conn, key: str, value: str):
+    with conn.cursor() as c:
+        c.execute(
+            """INSERT INTO system_status(key, value, updated_at)
+               VALUES (%s,%s,NOW())
+               ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()""",
+            (key, value),
+        )
+    conn.commit()
+
+
+def _already_processed(conn, message_id: str) -> bool:
+    if not message_id:
+        return False
+    with conn.cursor() as c:
+        c.execute("SELECT 1 FROM processed WHERE message_id=%s", (message_id,))
+        return c.fetchone() is not None
+
+
+def _mark_processed(conn, message_id: str, action: str):
+    if not message_id:
+        return
+    with conn.cursor() as c:
+        c.execute(
+            """INSERT INTO processed(message_id, action, processed_at)
+               VALUES (%s,%s,NOW())
+               ON CONFLICT (message_id) DO UPDATE SET action=EXCLUDED.action, processed_at=NOW()""",
+            (message_id, action),
+        )
+    conn.commit()
+
+
+def _db():
+    conn = get_pg_conn()
+    ensure_schema_pg(conn)
+    return conn
+
+
+# ----------------- Main handler -----------------
+def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
+    msg = email.message_from_bytes(raw_bytes)
+    mid = msg.get("Message-ID", "")
+
     subj = _dec(msg.get("Subject", ""))
     body = _body(msg)
     from_email = email.utils.parseaddr(msg.get("From", ""))[1]
 
     if _is_no_reply(from_email, msg):
-        _mark_read(service, msg_id)
+        print("[SKIP marketing/no-reply]", from_email)
+        _mark_read(service, gmail_msg_id)
         return
 
-    # dedupe
-    if mid:
-        with conn.cursor() as c:
-            c.execute("SELECT 1 FROM processed WHERE message_id=%s", (mid,))
-            if c.fetchone():
-                return
+    if mid and _already_processed(conn, mid):
+        print("[SKIP already processed]", mid)
+        _mark_read(service, gmail_msg_id)
+        return
 
     thread_bundle = _get_thread_bundle(service, thread_id)
     thread_text = summarize_thread(thread_bundle)
@@ -418,28 +470,30 @@ def handle(service, conn, raw, thread_id, msg_id):
     ref_dt = received_local_dt(msg)
     plan = decide_action(extract, ref_dt)
 
-    name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
+    action = (plan.get("action") or "skip").lower()
+    name = (extract.get("name") or "").strip() if isinstance(extract, dict) else ""
+    if not name:
+        name = (from_email.split("@")[0] if from_email else "Guest")
 
-    # phone: from LLM extract if present else regex
-    phone = (extract.get("phone") or "").strip() if isinstance(extract, dict) else ""
+    phone = None
+    if isinstance(extract, dict):
+        phone = (extract.get("phone") or "").strip() or None
     if not phone:
-        phone = extract_phone_best_effort(body) or None
+        phone = extract_phone_best_effort(body)
 
-    # detect update request
     wants_update = detect_update_request(subj, body)
 
-    action = plan.get("action")
+    print(f"[EMAIL] from={from_email} action={action} conf={plan.get('confidence',0):.2f} update={wants_update}")
+    _status_set(conn, "agent_last_email_from", from_email or "")
+    _status_set(conn, "agent_last_subject", subj[:140])
+    _status_set(conn, "agent_last_action", action)
 
-    _status_set(conn, "last_subject", subj)
-    _status_set(conn, "last_email_from", from_email)
-    _status_set(conn, "agent_last_seen_action", str(action))
-
-    # 1) Reservation confirm/update
+    # 1) Reservation (confirm/update)
     if action == "confirm":
-        # if update requested, cancel previous confirmed reservation first
-        old = None
+        # If update requested: cancel latest confirmed reservation for that email first
+        cancelled_old = None
         if wants_update:
-            old = cancel_latest_reservation(conn, from_email)
+            cancelled_old = cancel_latest_reservation(conn, from_email)
 
         ok, code, reason = reserve(
             conn,
@@ -450,27 +504,15 @@ def handle(service, conn, raw, thread_id, msg_id):
             date_iso=plan.get("date_iso"),
             time_24=plan.get("time_24"),
             source="email",
-            capacity=DEFAULT_CAPACITY
+            capacity=CAPACITY,
         )
 
         if not ok:
-            # if we cancelled old but new booking failed, you may want to restore old.
-            # For now: we’ll just suggest alternatives.
-            alternatives = next_available_slots(conn, plan.get("date_iso"), capacity=DEFAULT_CAPACITY, limit=3)
+            alternatives = next_available_slots(conn, plan.get("date_iso"), capacity=CAPACITY, limit=3)
             body_text = _tpl_slot_full(name, plan.get("date_iso"), plan.get("time_24"), alternatives)
             _send(service, from_email, f"Re: {subj} — Time Unavailable", body_text, in_reply_to=mid, thread_id=thread_id)
-
-            if mid:
-                with conn.cursor() as c:
-                    c.execute(
-                        """INSERT INTO processed(message_id, action, processed_at)
-                           VALUES (%s,%s,NOW())
-                           ON CONFLICT (message_id) DO UPDATE SET action=EXCLUDED.action, processed_at=NOW()""",
-                        (mid, "slot_full")
-                    )
-                conn.commit()
-
-            _mark_read(service, msg_id)
+            _mark_processed(conn, mid, "slot_full")
+            _mark_read(service, gmail_msg_id)
             return
 
         body_text = _tpl_confirm(
@@ -479,105 +521,75 @@ def handle(service, conn, raw, thread_id, msg_id):
             plan.get("time_24"),
             str(plan.get("party_size")),
             confirmation_code=code,
-            updated=bool(wants_update and old)
+            updated=bool(wants_update and cancelled_old),
         )
 
-        subject_suffix = "— Reservation Updated" if (wants_update and old) else "— Reservation Confirmed"
-        _send(service, from_email, f"Re: {subj} {subject_suffix}", body_text, in_reply_to=mid, thread_id=thread_id)
+        suffix = "— Reservation Updated" if (wants_update and cancelled_old) else "— Reservation Confirmed"
+        _send(service, from_email, f"Re: {subj} {suffix}", body_text, in_reply_to=mid, thread_id=thread_id)
 
-        if mid:
-            with conn.cursor() as c:
-                c.execute(
-                    """INSERT INTO processed(message_id, action, processed_at)
-                       VALUES (%s,%s,NOW())
-                       ON CONFLICT (message_id) DO UPDATE SET action=EXCLUDED.action, processed_at=NOW()""",
-                    (mid, "update_confirm" if (wants_update and old) else "confirm")
-                )
-            conn.commit()
-
-        _mark_read(service, msg_id)
+        _mark_processed(conn, mid, "update_confirm" if (wants_update and cancelled_old) else "confirm")
+        _mark_read(service, gmail_msg_id)
         return
 
-    # 2) Ask missing details
+    # 2) Ask missing
     if action == "ask_missing":
         hd = bool(plan.get("date_iso"))
         ht = bool(plan.get("time_24"))
         hp = bool(plan.get("party_size"))
-
-        _send(service, from_email, f"Re: {subj} — One quick detail", _tpl_missing(name, hd, ht, hp),
-              in_reply_to=mid, thread_id=thread_id)
-
-        if mid:
-            with conn.cursor() as c:
-                c.execute(
-                    """INSERT INTO processed(message_id, action, processed_at)
-                       VALUES (%s,%s,NOW())
-                       ON CONFLICT (message_id) DO UPDATE SET action=EXCLUDED.action, processed_at=NOW()""",
-                    (mid, "ask_missing")
-                )
-            conn.commit()
-
-        _mark_read(service, msg_id)
+        _send(service, from_email, f"Re: {subj} — One quick detail", _tpl_missing(name, hd, ht, hp), in_reply_to=mid, thread_id=thread_id)
+        _mark_processed(conn, mid, "ask_missing")
+        _mark_read(service, gmail_msg_id)
         return
 
     # 3) Feedback
     if action == "feedback":
-        sentiment, score = analyze_sentiment_with_backoff(body)
-        discount = choose_discount(sentiment, score, body)
+        sentiment, score = analyze_sentiment_simple(body)
+        discount = choose_discount(sentiment, score)
         prefix = "CARE" if sentiment == "negative" else "THANKS"
         code = _random_code(prefix, discount)
-        persist_coupon(conn, from_email, code, discount, sentiment, score)
 
-        reply_body = generate_personalized_reply(name, sentiment, score, discount, code, body)
+        persist_coupon(conn, from_email, code, discount, sentiment, score)
+        reply_body = generate_feedback_reply(name, sentiment, discount, code)
         _send(service, from_email, f"Re: {subj}", reply_body, in_reply_to=mid, thread_id=thread_id)
         log_feedback(conn, from_email, sentiment, score, discount, code, body, reply_body)
 
-        if mid:
-            with conn.cursor() as c:
-                c.execute(
-                    """INSERT INTO processed(message_id, action, processed_at)
-                       VALUES (%s,%s,NOW())
-                       ON CONFLICT (message_id) DO UPDATE SET action=EXCLUDED.action, processed_at=NOW()""",
-                    (mid, "feedback")
-                )
-            conn.commit()
-
-        _mark_read(service, msg_id)
+        _mark_processed(conn, mid, "feedback")
+        _mark_read(service, gmail_msg_id)
         return
 
-    # 4) skip
-    if mid:
-        with conn.cursor() as c:
-            c.execute(
-                """INSERT INTO processed(message_id, action, processed_at)
-                   VALUES (%s,%s,NOW())
-                   ON CONFLICT (message_id) DO UPDATE SET action=EXCLUDED.action, processed_at=NOW()""",
-                (mid, "skip")
-            )
-        conn.commit()
+    # 4) Skip
+    print("[SKIP other]", from_email)
+    _mark_processed(conn, mid, "skip")
+    _mark_read(service, gmail_msg_id)
 
-    _mark_read(service, msg_id)
 
 def main():
+    print("✅ agent starting...")
+    print("✅ DATABASE_URL set:", bool(os.getenv("DATABASE_URL")))
+    print("✅ token.json exists:", os.path.exists("token.json"))
+    print("✅ client_secret.json exists:", os.path.exists("client_secret.json"))
+
     service = get_gmail_service()
     conn = _db()
+
     _status_set(conn, "agent_last_start", time.strftime("%Y-%m-%d %H:%M:%S"))
 
-    import sys
-    if "--send-pending" in sys.argv:
-        # not used here, keep simple
-        return
-
     messages = _fetch_unseen(service)
+    print(f"[INFO] fetched {len(messages)} unread messages")
     _status_set(conn, "agent_last_fetched", str(len(messages)))
 
-    for msg_id, thread_id, raw in messages:
+    for gmail_msg_id, thread_id, raw_bytes in messages:
         try:
-            handle(service, conn, raw, thread_id, msg_id)
+            handle(service, conn, raw_bytes, thread_id, gmail_msg_id)
         except Exception as e:
-            print("[ERR]", e)
+            print("[ERR]", repr(e))
 
     _status_set(conn, "agent_last_run", time.strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        conn.close()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()

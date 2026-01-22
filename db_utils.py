@@ -1,92 +1,99 @@
-import sqlite3
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple, List, Dict
 
-OPEN_HOUR = 18  # 6pm
-CLOSE_HOUR = 24 # 12am (midnight boundary)
-SLOT_MINUTES = 30
+OPEN_HOUR = 18
 DEFAULT_CAPACITY = 10
-
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS reservations(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            confirmation_code TEXT UNIQUE,
-            name TEXT,
-            email TEXT,
-            phone TEXT,
-            party_size INTEGER,
-            slot_datetime TEXT,
-            status TEXT DEFAULT 'confirmed',
-            source TEXT DEFAULT 'email',
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS google_reviews(
-            review_id TEXT PRIMARY KEY,
-            rating INTEGER,
-            comment TEXT,
-            author_name TEXT,
-            created_at TEXT,
-            replied INTEGER DEFAULT 0,
-            last_checked_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS claims(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            review_id TEXT,
-            name TEXT,
-            email TEXT,
-            phone TEXT,
-            visit_date TEXT,
-            details TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    conn.commit()
-
-def _slot_key(date_iso: str, time_24: str) -> str:
-    # stored as 'YYYY-MM-DD HH:MM'
-    return f"{date_iso} {time_24}"
 
 def slot_within_hours(time_24: str) -> bool:
     try:
         hh, mm = map(int, time_24.split(":"))
     except Exception:
         return False
-
-    # allowed: 18:00 .. 23:30
-    if hh < OPEN_HOUR or hh > 23:
+    if hh < 18 or hh > 23:
         return False
     if hh == 23 and mm > 30:
         return False
     return mm in (0, 30)
 
-def list_slots_for_date(date_iso: str):
-    # 18:00 -> 23:30 inclusive
+def list_slots_for_date(_date_iso: str) -> List[str]:
     slots = []
-    for hh in range(OPEN_HOUR, 24):
+    for hh in range(18, 24):
         for mm in (0, 30):
             if hh == 23 and mm > 30:
                 continue
-            slots.append(f"{hh:02d}:{mm:02d}")
-    return [s for s in slots if slot_within_hours(s)]
+            t = f"{hh:02d}:{mm:02d}"
+            if slot_within_hours(t):
+                slots.append(t)
+    return slots
 
-def count_booked(conn: sqlite3.Connection, date_iso: str, time_24: str) -> int:
-    c = conn.cursor()
-    slot = _slot_key(date_iso, time_24)
-    row = c.execute(
-        "SELECT COUNT(1) FROM reservations WHERE slot_datetime=? AND status='confirmed'",
-        (slot,)
-    ).fetchone()
-    return int(row[0] or 0)
+def _slot_dt(date_iso: str, time_24: str) -> datetime:
+    return datetime.fromisoformat(f"{date_iso} {time_24}")
+
+def count_booked(conn, date_iso: str, time_24: str) -> int:
+    slot_dt = _slot_dt(date_iso, time_24)
+    with conn.cursor() as c:
+        c.execute(
+            "SELECT COUNT(1) FROM reservations WHERE slot_datetime=%s AND status='confirmed'",
+            (slot_dt,)
+        )
+        return int(c.fetchone()[0] or 0)
+
+def get_latest_active_reservation(conn, email: str) -> Optional[Dict]:
+    """
+    Most recent confirmed reservation for this email (future or latest overall).
+    """
+    with conn.cursor() as c:
+        c.execute(
+            """
+            SELECT id, confirmation_code, name, email, phone, party_size, slot_datetime, status, source, created_at
+            FROM reservations
+            WHERE email=%s AND status='confirmed'
+            ORDER BY slot_datetime DESC
+            LIMIT 1
+            """,
+            (email,)
+        )
+        row = c.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "confirmation_code": row[1],
+        "name": row[2],
+        "email": row[3],
+        "phone": row[4],
+        "party_size": row[5],
+        "slot_datetime": row[6],
+        "status": row[7],
+        "source": row[8],
+        "created_at": row[9],
+    }
+
+def cancel_reservation_by_id(conn, res_id: int, reason: str = "customer_update") -> bool:
+    with conn.cursor() as c:
+        c.execute(
+            """
+            UPDATE reservations
+            SET status='cancelled'
+            WHERE id=%s AND status='confirmed'
+            """,
+            (res_id,)
+        )
+        updated = c.rowcount
+    conn.commit()
+    return updated > 0
+
+def cancel_latest_reservation(conn, email: str) -> Optional[Dict]:
+    old = get_latest_active_reservation(conn, email)
+    if not old:
+        return None
+    cancel_reservation_by_id(conn, old["id"])
+    return old
 
 def reserve(
-    conn: sqlite3.Connection,
+    conn,
     *,
     name: str,
     email: str,
@@ -96,12 +103,12 @@ def reserve(
     time_24: str,
     source: str = "email",
     capacity: int = DEFAULT_CAPACITY
-):
+) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Attempt to reserve a slot.
-    Returns (ok: bool, confirmation_code: Optional[str], reason: Optional[str])
+    Returns: (ok, confirmation_code, reason)
     """
-    ensure_schema(conn)
+    if not date_iso or not time_24:
+        return False, None, "Missing date or time."
 
     if not slot_within_hours(time_24):
         return False, None, "Requested time is outside operating hours or not on a 30-min boundary."
@@ -114,18 +121,19 @@ def reserve(
     base = f"{email}|{date_iso}|{time_24}|{datetime.utcnow().timestamp()}"
     code = "RES-" + hashlib.sha256(base.encode()).hexdigest()[:8].upper()
 
-    slot = _slot_key(date_iso, time_24)
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO reservations(confirmation_code, name, email, phone, party_size, slot_datetime, source)
-           VALUES (?,?,?,?,?,?,?)""",
-        (code, name, email, phone, party_size, slot, source)
-    )
+    slot_dt = _slot_dt(date_iso, time_24)
+    with conn.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO reservations(confirmation_code, name, email, phone, party_size, slot_datetime, status, source)
+            VALUES (%s,%s,%s,%s,%s,%s,'confirmed',%s)
+            """,
+            (code, name, email, phone, party_size, slot_dt, source)
+        )
     conn.commit()
     return True, code, None
 
-def next_available_slots(conn: sqlite3.Connection, date_iso: str, *, capacity: int = DEFAULT_CAPACITY, limit: int = 3):
-    ensure_schema(conn)
+def next_available_slots(conn, date_iso: str, *, capacity: int = DEFAULT_CAPACITY, limit: int = 3) -> List[str]:
     out = []
     for t in list_slots_for_date(date_iso):
         if count_booked(conn, date_iso, t) < capacity:

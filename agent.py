@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Agent (Postgres) + Gmail + LLM
-- Fetch unread messages via Gmail API
-- Decide action via llm_agent.py: confirm / ask_missing / feedback / skip
-- Capacity-aware reservations stored in Postgres
-- Reservation updates: if email asks to change/update, cancel latest confirmed reservation for that email and book new one
-- Feedback: sentiment + coupon issuance + log
-- Dedupe via processed table (message_id primary key)
-- Mark email as READ after processing
-- Writes system_status heartbeats for dashboard
+Restaurant Email Agent (Postgres) + Gmail API (OAuth) + LLM
+
+What it does:
+- Fetch unread emails (uses the OLD/simple fetch: INBOX + is:unread query)
+- Build recent thread context
+- Use llm_agent.py to decide action: confirm / ask_missing / feedback / skip
+- Confirm reservations (capacity-aware) into Postgres
+- Update reservations: if email asks to update/change/reschedule, cancel latest confirmed reservation for that email, then book new one
+- Best-effort phone extraction from email body + store with reservation
+- Feedback: simple sentiment -> issue coupon -> log
+- Dedupe using Postgres `processed` table keyed by Message-ID
+- Mark emails as READ (remove UNREAD label)
+- Write `system_status` heartbeats for dashboard
 
 ENV:
   DATABASE_URL=postgresql://...
-  OPENAI_API_KEY=...
+  OPENAI_API_KEY=... (optional; LLM is in llm_agent.py)
   RESTAURANT_NAME=...
   DEFAULT_CAPACITY=10
-  GMAIL_QUERY=is:unread
   MAX_PROCESS=10
-  GMAIL_TOKEN_JSON=<contents of token.json> (optional bootstrap on Render)
+  GMAIL_QUERY=is:unread
+  GMAIL_TOKEN_JSON=<contents of token.json> (optional bootstrap, useful on Render)
 """
 
 from __future__ import print_function
@@ -41,12 +45,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from db_pg import get_pg_conn, ensure_schema_pg
-from db_utils import (
-    reserve,
-    next_available_slots,
-    cancel_latest_reservation,
-    DEFAULT_CAPACITY,
-)
+from db_utils import reserve, next_available_slots, cancel_latest_reservation, DEFAULT_CAPACITY
 from llm_agent import summarize_thread, call_llm_extract, decide_action, received_local_dt
 
 load_dotenv()
@@ -59,9 +58,9 @@ CAPACITY = int(os.getenv("DEFAULT_CAPACITY", str(DEFAULT_CAPACITY)))
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 
-# ----------------- Helpers -----------------
+# ----------------- Small helpers -----------------
 def _bootstrap_token_json():
-    """If running on Render, you can store token.json content in env var GMAIL_TOKEN_JSON."""
+    """Optional: allow token.json content to be provided via env var (useful on Render)."""
     token_env = os.getenv("GMAIL_TOKEN_JSON")
     if token_env and not os.path.exists("token.json"):
         with open("token.json", "w") as f:
@@ -69,6 +68,7 @@ def _bootstrap_token_json():
 
 
 def _is_no_reply(addr, msg):
+    """Filter obvious marketing / no-reply senders."""
     a = (addr or "").lower()
     if any(x in a for x in ["no-reply", "noreply", "notifications", "mailer-daemon"]):
         return True
@@ -118,8 +118,20 @@ def _body(msg):
     return ""
 
 
+def detect_update_request(subject: str, body: str) -> bool:
+    """Heuristic: treat as update/reschedule if they mention change/update etc."""
+    text = f"{subject}\n{body}".lower()
+    keywords = [
+        "update my reservation", "change my reservation", "modify my reservation",
+        "reschedule", "change the time", "change the date", "move the reservation",
+        "need to change", "can we change", "instead of", "correction", "correct my reservation",
+        "change reservation", "update reservation",
+    ]
+    return any(k in text for k in keywords)
+
+
 def extract_phone_best_effort(text: str):
-    """Loose phone extractor: grabs +digits or (xxx) xxx-xxxx style; requires >=9 digits."""
+    """Extract a phone-like string from email body. Requires >=9 digits."""
     if not text:
         return None
     m = re.search(r"(\+?\d[\d\-\(\)\s]{8,}\d)", text)
@@ -132,24 +144,14 @@ def extract_phone_best_effort(text: str):
     return re.sub(r"\s+", " ", raw).strip()
 
 
-def detect_update_request(subject: str, body: str) -> bool:
-    text = (subject + "\n" + body).lower()
-    keywords = [
-        "update my reservation", "change my reservation", "modify my reservation",
-        "reschedule", "change the time", "change the date", "move the reservation",
-        "need to change", "can we change", "instead of", "correction", "correct my reservation",
-        "change reservation", "update reservation",
-    ]
-    return any(k in text for k in keywords)
-
-
 def _random_code(prefix: str, pct: int) -> str:
     tail = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"{prefix}{pct}-{tail}"
 
 
-# ----------------- Gmail -----------------
+# ----------------- Gmail helpers -----------------
 def get_gmail_service():
+    """Authenticate (OAuth) and return a Gmail API service."""
     _bootstrap_token_json()
 
     creds = None
@@ -161,7 +163,7 @@ def get_gmail_service():
             creds.refresh(Request())
         else:
             if not os.path.exists("client_secret.json"):
-                raise RuntimeError("client_secret.json missing. Put it in project root.")
+                raise RuntimeError("client_secret.json missing in project root.")
             flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
             creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
@@ -170,7 +172,29 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
+def _execute_with_retries(req, retries=5, base=1.0, cap=30.0, what="request"):
+    """Gmail API call with exponential backoff for transient errors."""
+    for attempt in range(retries):
+        try:
+            return req.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in (500, 502, 503, 504):
+                delay = min(cap, base * (2 ** attempt) + random.random())
+                print(f"[RETRY] {what} failed with {status}, retrying in {delay:.1f}s ({attempt+1}/{retries})")
+                time.sleep(delay)
+                continue
+            raise
+        except Exception as e:
+            delay = min(cap, base * (2 ** attempt) + random.random())
+            print(f"[RETRY] {what} exception {e!r}, retrying in {delay:.1f}s ({attempt+1}/{retries})")
+            time.sleep(delay)
+            continue
+    raise RuntimeError(f"{what} failed after {retries} retries")
+
+
 def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
+    """Send a message via Gmail API."""
     m = EmailMessage()
     sender_email = service.users().getProfile(userId="me").execute().get("emailAddress", "me")
     m["From"] = sender_email
@@ -189,6 +213,7 @@ def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
 
 
 def _mark_read(service, msg_id):
+    """Remove UNREAD label so it doesn't come back next run."""
     try:
         service.users().messages().modify(
             userId="me",
@@ -199,33 +224,48 @@ def _mark_read(service, msg_id):
         print("[WARN] failed to mark as read:", e)
 
 
-def _execute_with_retries(req, retries=5, base=1.0, cap=30.0, what="request"):
-    for attempt in range(retries):
-        try:
-            return req.execute()
-        except HttpError as e:
-            status = getattr(e.resp, "status", None)
-            if status in (500, 502, 503, 504):
-                delay = min(cap, base * (2 ** attempt) + random.random())
-                print(f"[RETRY] {what} {status}, retry in {delay:.1f}s")
-                time.sleep(delay)
-                continue
-            raise
-        except Exception as e:
-            delay = min(cap, base * (2 ** attempt) + random.random())
-            print(f"[RETRY] {what} exception {e!r}, retry in {delay:.1f}s")
-            time.sleep(delay)
-            continue
-    raise RuntimeError(f"{what} failed after {retries} retries")
+# ----------------- OLD fetch (keep simple) -----------------
+def _fetch_unseen(service):
+    """
+    OLD/simple behavior:
+      - query (default is:unread)
+      - labelIds=["INBOX"]
+      - maxResults=MAX_PROCESS
+    """
+    max_process = int(os.getenv("MAX_PROCESS", "10"))
+    query = os.getenv("GMAIL_QUERY", "is:unread")
+
+    resp = _execute_with_retries(
+        service.users().messages().list(
+            userId="me",
+            q=query,
+            labelIds=["INBOX"],
+            maxResults=max_process,
+        ),
+        what="messages.list",
+    )
+
+    out = []
+    for m in (resp.get("messages") or []):
+        msg_id = m["id"]
+        thread_id = m.get("threadId")
+        raw_resp = _execute_with_retries(
+            service.users().messages().get(userId="me", id=msg_id, format="raw"),
+            what="messages.get(raw)",
+        )
+        raw_bytes = base64.urlsafe_b64decode(raw_resp["raw"])
+        out.append((msg_id, thread_id, raw_bytes))
+    return out
 
 
 def _get_thread_bundle(service, thread_id):
+    """Return last few messages in thread as dicts: {from,date,subject,body}."""
     data = _execute_with_retries(
         service.users().threads().get(userId="me", id=thread_id, format="full"),
         what="threads.get",
     )
     items = []
-    for part in data.get("messages", [])[-4:]:
+    for part in (data.get("messages") or [])[-4:]:
         payload = part.get("payload", {})
         headers = payload.get("headers", [])
 
@@ -239,7 +279,6 @@ def _get_thread_bundle(service, thread_id):
         subj = hdr("Subject")
         dt = hdr("Date")
 
-        # best-effort plain text extraction from Gmail payload
         body = ""
         def walk(parts):
             nonlocal body
@@ -257,27 +296,6 @@ def _get_thread_bundle(service, thread_id):
             body = "(no text body)"
         items.append({"from": frm, "date": dt, "subject": subj, "body": body})
     return items
-
-
-def _fetch_unseen(service):
-    max_process = int(os.getenv("MAX_PROCESS", "10"))
-    query = os.getenv("GMAIL_QUERY", "is:unread")
-
-    resp = _execute_with_retries(
-        service.users().messages().list(userId="me", q=query, labelIds=["INBOX"], maxResults=max_process),
-        what="messages.list",
-    )
-    out = []
-    for m in resp.get("messages", []) or []:
-        msg_id = m["id"]
-        thread_id = m.get("threadId")
-        raw_resp = _execute_with_retries(
-            service.users().messages().get(userId="me", id=msg_id, format="raw"),
-            what="messages.get(raw)",
-        )
-        raw_bytes = base64.urlsafe_b64decode(raw_resp["raw"])
-        out.append((msg_id, thread_id, raw_bytes))
-    return out
 
 
 # ----------------- Templates -----------------
@@ -336,7 +354,7 @@ def _tpl_slot_full(name, d, requested_t, alternatives):
     return "\n".join([x for x in L if x])
 
 
-# ----------------- Feedback (stable minimal) -----------------
+# ----------------- Feedback (stable minimal, Postgres) -----------------
 def analyze_sentiment_simple(text: str):
     t = (text or "").lower()
     neg_hits = sum(w in t for w in ["awful", "terrible", "horrible", "disgusting", "cold", "late", "rude", "worst", "refund", "angry", "disappointed"])
@@ -357,7 +375,6 @@ def choose_discount(sentiment: str, score: int) -> int:
         return 10 if score == 1 else 5
     if sentiment == "neutral":
         return 15
-    # negative
     return 25 if score >= 4 else 15
 
 
@@ -405,7 +422,13 @@ def generate_feedback_reply(name: str, sentiment: str, discount: int, code: str)
     )
 
 
-# ----------------- Postgres status + dedupe -----------------
+# ----------------- Postgres DB + status + dedupe -----------------
+def _db():
+    conn = get_pg_conn()
+    ensure_schema_pg(conn)
+    return conn
+
+
 def _status_set(conn, key: str, value: str):
     with conn.cursor() as c:
         c.execute(
@@ -438,12 +461,6 @@ def _mark_processed(conn, message_id: str, action: str):
     conn.commit()
 
 
-def _db():
-    conn = get_pg_conn()
-    ensure_schema_pg(conn)
-    return conn
-
-
 # ----------------- Main handler -----------------
 def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
     msg = email.message_from_bytes(raw_bytes)
@@ -463,6 +480,7 @@ def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
         _mark_read(service, gmail_msg_id)
         return
 
+    # Build thread context and decide action
     thread_bundle = _get_thread_bundle(service, thread_id)
     thread_text = summarize_thread(thread_bundle)
 
@@ -471,7 +489,11 @@ def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
     plan = decide_action(extract, ref_dt)
 
     action = (plan.get("action") or "skip").lower()
-    name = (extract.get("name") or "").strip() if isinstance(extract, dict) else ""
+    conf = float(plan.get("confidence", 0.0) or 0.0)
+
+    name = ""
+    if isinstance(extract, dict):
+        name = (extract.get("name") or "").strip()
     if not name:
         name = (from_email.split("@")[0] if from_email else "Guest")
 
@@ -483,14 +505,13 @@ def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
 
     wants_update = detect_update_request(subj, body)
 
-    print(f"[EMAIL] from={from_email} action={action} conf={plan.get('confidence',0):.2f} update={wants_update}")
+    print(f"[EMAIL] from={from_email} action={action} conf={conf:.2f} update={wants_update}")
     _status_set(conn, "agent_last_email_from", from_email or "")
     _status_set(conn, "agent_last_subject", subj[:140])
     _status_set(conn, "agent_last_action", action)
 
-    # 1) Reservation (confirm/update)
+    # 1) Reservation confirm/update
     if action == "confirm":
-        # If update requested: cancel latest confirmed reservation for that email first
         cancelled_old = None
         if wants_update:
             cancelled_old = cancel_latest_reservation(conn, from_email)
@@ -523,7 +544,6 @@ def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
             confirmation_code=code,
             updated=bool(wants_update and cancelled_old),
         )
-
         suffix = "— Reservation Updated" if (wants_update and cancelled_old) else "— Reservation Confirmed"
         _send(service, from_email, f"Re: {subj} {suffix}", body_text, in_reply_to=mid, thread_id=thread_id)
 
@@ -531,7 +551,7 @@ def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
         _mark_read(service, gmail_msg_id)
         return
 
-    # 2) Ask missing
+    # 2) Ask missing details
     if action == "ask_missing":
         hd = bool(plan.get("date_iso"))
         ht = bool(plan.get("time_24"))
@@ -550,6 +570,7 @@ def handle(service, conn, raw_bytes, thread_id, gmail_msg_id):
 
         persist_coupon(conn, from_email, code, discount, sentiment, score)
         reply_body = generate_feedback_reply(name, sentiment, discount, code)
+
         _send(service, from_email, f"Re: {subj}", reply_body, in_reply_to=mid, thread_id=thread_id)
         log_feedback(conn, from_email, sentiment, score, discount, code, body, reply_body)
 
@@ -570,12 +591,17 @@ def main():
     print("✅ client_secret.json exists:", os.path.exists("client_secret.json"))
 
     service = get_gmail_service()
-    conn = _db()
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        print("✅ Gmail account:", profile.get("emailAddress"))
+    except Exception as e:
+        print("[WARN] Could not fetch Gmail profile:", e)
 
+    conn = _db()
     _status_set(conn, "agent_last_start", time.strftime("%Y-%m-%d %H:%M:%S"))
 
     messages = _fetch_unseen(service)
-    print(f"[INFO] fetched {len(messages)} unread messages")
+    print(f"[INFO] fetched {len(messages)} unread messages (INBOX + {os.getenv('GMAIL_QUERY','is:unread')})")
     _status_set(conn, "agent_last_fetched", str(len(messages)))
 
     for gmail_msg_id, thread_id, raw_bytes in messages:

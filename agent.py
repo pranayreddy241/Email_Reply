@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """
-Restaurant Email Agent (Gmail API / OAuth + LLM)
+Restaurant Email Agent (Gmail API / OAuth + LLM) — Postgres version
+
+What it does:
 - Fetch unread messages via Gmail API
 - Use llm_agent.py to decide action: confirm / ask_missing / feedback / skip
 - Auto-reply reservations (capacity-aware + stores reservations)
+- Reservation update: if user asks to change/update/reschedule, cancel latest confirmed reservation and book new one
+- Phone capture: from LLM extract if present else regex from email body
 - Auto-reply feedback with sentiment + coupon + personalized reply
-- Prevent double-processing using SQLite `processed` table (Message-ID)
+- Prevent double-processing using Postgres `processed` table (Message-ID)
 - Log feedback emails + replies in `feedback_log`
 - Mark processed emails as READ in Gmail (remove UNREAD label)
 
-Adds:
-- Reservation updates: if user asks change/update/reschedule, cancel their latest confirmed reservation and book new one
-- Phone capture: best-effort extract phone number from email body and store it
-
-Usage:
-  python agent.py
-  python agent.py --send-pending
-
 Requires:
-  client_secret.json (OAuth)
-  token.json (auto-generated)
-  .env with OPENAI_API_KEY, etc.
+- client_secret.json (OAuth)
+- token.json (auto-generated)
+- .env with OPENAI_API_KEY, etc.
+- DATABASE_URL set for Postgres (Render will provide this automatically)
 """
 
 from __future__ import print_function
 
 import os
 import re
-import sqlite3
 import email
 import base64
 import time
@@ -43,16 +39,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# Reservations + schema helpers
-from db_utils import (
-    ensure_schema,
-    reserve,
-    next_available_slots,
-    cancel_latest_reservation,
-    DEFAULT_CAPACITY,
-)
+# Postgres connection + schema
+from db_pg import get_pg_conn, ensure_schema_pg
 
-# LLM helper module (your file)
+# Reservation + business logic helpers (Postgres-safe inside these functions)
+from db_utils import reserve, next_available_slots, cancel_latest_reservation, DEFAULT_CAPACITY
+
+# LLM helper module
 from llm_agent import summarize_thread, call_llm_extract, decide_action, received_local_dt
 
 load_dotenv()
@@ -61,12 +54,10 @@ load_dotenv()
 RESTAURANT_NAME = os.getenv("RESTAURANT_NAME", "My Restaurant")
 RESERVATION_PHONE = os.getenv("RESERVATION_PHONE", "")
 RESERVATION_LINK = os.getenv("RESERVATION_LINK", "")
-DB_PATH = os.getenv("AGENT_DB_PATH", "email_agent.sqlite")
-
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 
-# ----------------- Gmail helpers -----------------
+# ----------------- Helpers -----------------
 def _is_no_reply(addr, msg):
     """Filter obvious marketing / no-reply senders."""
     a = (addr or "").lower()
@@ -77,11 +68,25 @@ def _is_no_reply(addr, msg):
     return False
 
 
+def _bootstrap_token_json():
+    """
+    Optional: if you store token JSON in env var (useful for Render),
+    set GMAIL_TOKEN_JSON to the full token json string.
+    """
+    token_env = os.getenv("GMAIL_TOKEN_JSON")
+    if token_env and not os.path.exists("token.json"):
+        with open("token.json", "w") as f:
+            f.write(token_env)
+
+
 def get_gmail_service():
     """Authenticate (OAuth) and return a Gmail API service."""
+    _bootstrap_token_json()
+
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -90,10 +95,10 @@ def get_gmail_service():
             creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
             token.write(creds.to_json())
+
     return build("gmail", "v1", credentials=creds)
 
 
-# ----------------- Parsing helpers -----------------
 def _dec(s):
     if not s:
         return ""
@@ -154,7 +159,7 @@ def _send(service, to_addr, subject, body, in_reply_to=None, thread_id=None):
     return service.users().messages().send(userId="me", body=payload).execute()
 
 
-def _execute_with_retries(req, retries=5, base=1.0, cap=30.0, what="request"):
+def _execute_with_retries(req, retries=5, base_delay=1.0, cap=30.0, what="request"):
     """Generic Gmail API call with exponential backoff."""
     for attempt in range(retries):
         try:
@@ -162,52 +167,38 @@ def _execute_with_retries(req, retries=5, base=1.0, cap=30.0, what="request"):
         except HttpError as e:
             status = getattr(e.resp, "status", None)
             if status in (500, 502, 503, 504):
-                delay = min(cap, base * (2 ** attempt) + random.random())
+                delay = min(cap, base_delay * (2 ** attempt) + random.random())
                 print(f"[RETRY] {what} failed with {status}, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
                 time.sleep(delay)
                 continue
             raise
         except Exception as e:
-            delay = min(cap, base * (2 ** attempt) + random.random())
+            delay = min(cap, base_delay * (2 ** attempt) + random.random())
             print(f"[RETRY] {what} exception {e!r}, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
             time.sleep(delay)
             continue
     raise RuntimeError(f"{what} failed after {retries} retries")
 
 
-# ----------------- Reservation update + phone helpers -----------------
-def detect_update_request(subject: str, body: str) -> bool:
-    text = f"{subject}\n{body}".lower()
-    keywords = [
-        "update my reservation", "change my reservation", "modify my reservation", "reschedule",
-        "change the time", "change the date", "move the reservation", "need to change",
-        "can we change", "instead of", "correction", "correct my reservation",
-        "update reservation", "change reservation",
-    ]
-    return any(k in text for k in keywords)
-
-
-def extract_phone_best_effort(text: str):
-    """Extract a phone-like string from email body. Requires >=9 digits."""
-    if not text:
-        return None
-    m = re.search(r"(\+?\d[\d\-\(\)\s]{8,}\d)", text)
-    if not m:
-        return None
-    raw = m.group(1)
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) < 9:
-        return None
-    return re.sub(r"\s+", " ", raw).strip()
+def _mark_read(service, msg_id):
+    """Remove UNREAD label so it doesn't come back next run."""
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=msg_id,
+            body={"removeLabelIds": ["UNREAD"]},
+        ).execute()
+    except Exception as e:
+        print("[WARN] failed to mark as read:", e)
 
 
 # ----------------- Templates -----------------
 def _tpl_confirm(name, d, t, p, confirmation_code=None, updated=False):
-    title = "Your reservation is updated ✅" if updated else "Your reservation is confirmed ✅"
+    header = "Your reservation is updated ✅" if updated else "Your reservation is confirmed ✅"
     L = [
         f"Hi{(' ' + name) if name else ''},",
         "",
-        f"{title} at {RESTAURANT_NAME}.",
+        f"{header} at {RESTAURANT_NAME}.",
         f"• Date: {d}",
         f"• Time: {t}",
         f"• Party size: {p}",
@@ -258,6 +249,36 @@ def _tpl_slot_full(name, d, requested_t, alternatives):
         RESTAURANT_NAME,
     ]
     return "\n".join([x for x in L if x])
+
+
+# ----------------- Update detection + phone extraction -----------------
+def detect_update_request(subject: str, body: str) -> bool:
+    text = f"{subject}\n{body}".lower()
+    keywords = [
+        "update my reservation", "change my reservation", "modify my reservation", "reschedule",
+        "change the time", "change the date", "move the reservation", "can we move",
+        "can we change", "need to change", "instead of", "correction", "correct my reservation",
+        "update reservation", "change reservation",
+    ]
+    return any(k in text for k in keywords)
+
+
+def extract_phone_best_effort(text: str):
+    """
+    Extract a phone-like string from email body.
+    Requires at least 9 digits to reduce false matches.
+    """
+    if not text:
+        return None
+    m = re.search(r"(\+?\d[\d\-\(\)\s]{8,}\d)", text)
+    if not m:
+        return None
+    raw = m.group(1)
+    cleaned = re.sub(r"\s+", " ", raw).strip()
+    digits = re.sub(r"\D", "", cleaned)
+    if len(digits) < 9:
+        return None
+    return cleaned
 
 
 # ----------------- Feedback helpers (sentiment + coupons) -----------------
@@ -348,21 +369,28 @@ def _random_code(prefix: str, pct: int) -> str:
 
 
 def persist_coupon(conn, email_addr: str, code: str, discount: int, sentiment: str, score: int):
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR IGNORE INTO coupons(email, code, discount, sentiment, score) VALUES (?,?,?,?,?)",
-        (email_addr, code, discount, sentiment, score),
-    )
+    with conn.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO coupons(email, code, discount, sentiment, score)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (code) DO NOTHING
+            """,
+            (email_addr, code, discount, sentiment, score),
+        )
     conn.commit()
 
 
 def log_feedback(conn, email_addr: str, sentiment: str, score: int, discount: int,
                  code: str, original_text: str, reply_text: str):
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO feedback_log(email, sentiment, score, discount, code, original_text, reply_text)
-        VALUES (?,?,?,?,?,?,?)
-    """, (email_addr, sentiment, score, discount, code, original_text, reply_text))
+    with conn.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO feedback_log(email, sentiment, score, discount, code, original_text, reply_text)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (email_addr, sentiment, score, discount, code, original_text, reply_text),
+        )
     conn.commit()
 
 
@@ -435,67 +463,43 @@ def generate_personalized_reply(name: str, sentiment: str, score: int,
     )
 
 
-# ----------------- DB (with migrations) -----------------
+# ----------------- DB -----------------
 def _db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS processed(
-            message_id TEXT PRIMARY KEY,
-            processed_at TEXT
-        )
-    """)
-    c.execute("PRAGMA table_info(processed)")
-    cols = [row[1] for row in c.fetchall()]
-    if "action" not in cols:
-        c.execute("ALTER TABLE processed ADD COLUMN action TEXT")
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS drafts(
-            id INTEGER PRIMARY KEY,
-            to_email TEXT,
-            subject TEXT,
-            body TEXT,
-            in_reply_to TEXT,
-            created_at TEXT,
-            sent_at TEXT
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS coupons(
-            id INTEGER PRIMARY KEY,
-            email TEXT,
-            code TEXT UNIQUE,
-            discount INTEGER,
-            sentiment TEXT,
-            score INTEGER,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS feedback_log(
-            id INTEGER PRIMARY KEY,
-            email TEXT,
-            sentiment TEXT,
-            score INTEGER,
-            discount INTEGER,
-            code TEXT,
-            original_text TEXT,
-            reply_text TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    conn.commit()
-    ensure_schema(conn)
+    conn = get_pg_conn()
+    ensure_schema_pg(conn)
     return conn
 
 
-# ----------------- Thread + fetch helpers -----------------
+def _processed_has(conn, message_id: str) -> bool:
+    if not message_id:
+        return False
+    with conn.cursor() as c:
+        c.execute("SELECT 1 FROM processed WHERE message_id=%s", (message_id,))
+        return c.fetchone() is not None
+
+
+def _processed_put(conn, message_id: str, action: str):
+    if not message_id:
+        return
+    with conn.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO processed(message_id, action, processed_at)
+            VALUES (%s,%s,NOW())
+            ON CONFLICT (message_id)
+            DO UPDATE SET action=EXCLUDED.action, processed_at=NOW()
+            """,
+            (message_id, action),
+        )
+    conn.commit()
+
+
+# ----------------- Thread + fetch helpers (KEEPING YOUR OLD STYLE) -----------------
 def _get_thread_bundle(service, thread_id):
+    """
+    Return a condensed list of dicts for the last few messages in a thread:
+      {from, date, subject, body}
+    """
     data = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
     items = []
     for part in data.get("messages", [])[-4:]:
@@ -537,7 +541,9 @@ def _get_thread_bundle(service, thread_id):
 
 def _fetch_unseen(service):
     """
-    KEEP: your robust fetch with retries + fallback strategies.
+    Your original robust fetch:
+    Return list of tuples: (msg_id, thread_id, raw_bytes) for unread messages.
+    Uses robust retries + multiple strategies.
     """
     def _pull(query=None, labelIds=None, limit=50):
         params = {"userId": "me", "maxResults": limit}
@@ -586,25 +592,13 @@ def _fetch_unseen(service):
     return []
 
 
-def _mark_read(service, msg_id):
-    try:
-        service.users().messages().modify(
-            userId="me",
-            id=msg_id,
-            body={"removeLabelIds": ["UNREAD"]},
-        ).execute()
-    except Exception as e:
-        print("[WARN] failed to mark as read:", e)
-
-
 # ----------------- Main handler -----------------
-def handle(service, conn, raw, thread_id, gmail_msg_id):
+def handle(service, conn, raw, thread_id, msg_id):
     msg = email.message_from_bytes(raw)
     mid = msg.get("Message-ID")
-    c = conn.cursor()
 
-    # dedupe
-    if mid and c.execute("SELECT 1 FROM processed WHERE message_id=?", (mid,)).fetchone():
+    # Always skip if already processed to prevent loops
+    if mid and _processed_has(conn, mid):
         return
 
     subj = _dec(msg.get("Subject", ""))
@@ -613,7 +607,7 @@ def handle(service, conn, raw, thread_id, gmail_msg_id):
 
     if _is_no_reply(from_email, msg):
         print("[SKIP no-reply/marketing] ->", from_email)
-        _mark_read(service, gmail_msg_id)
+        _mark_read(service, msg_id)
         return
 
     # Thread context + LLM decision
@@ -629,26 +623,26 @@ def handle(service, conn, raw, thread_id, gmail_msg_id):
         f"date={plan.get('date_iso')} time={plan.get('time_24')} party={plan.get('party_size')}"
     )
 
-    name = (extract.get("name") or "").strip() or (from_email.split("@")[0])
-    wants_update = detect_update_request(subj, body)
+    name = (extract.get("name") or "").strip() if isinstance(extract, dict) else ""
+    if not name:
+        name = from_email.split("@")[0]
 
-    # phone capture: prefer LLM extract if present, else regex
+    # phone: from LLM extract if present else regex best-effort
     phone = None
-    try:
+    if isinstance(extract, dict):
         phone = (extract.get("phone") or "").strip() or None
-    except Exception:
-        phone = None
     if not phone:
         phone = extract_phone_best_effort(body)
 
-    # 1) Confirm reservation (+ update support)
-    if plan.get("action") == "confirm":
+    wants_update = detect_update_request(subj, body)
+    action = plan.get("action")
+
+    # 1) Confirm reservation (capacity-aware) + update support
+    if action == "confirm":
         old = None
         if wants_update:
-            try:
-                old = cancel_latest_reservation(conn, from_email)
-            except Exception as e:
-                print("[WARN] cancel_latest_reservation failed:", e)
+            # cancel their latest confirmed reservation before booking new one
+            old = cancel_latest_reservation(conn, from_email)
 
         ok, code, reason = reserve(
             conn,
@@ -676,52 +670,41 @@ def handle(service, conn, raw, thread_id, gmail_msg_id):
             )
             print("[SENT] slot full ->", from_email)
 
-            if mid:
-                c.execute(
-                    "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                    (mid, "slot_full"),
-                )
-                conn.commit()
-
-            _mark_read(service, gmail_msg_id)
+            _processed_put(conn, mid, "slot_full")
+            _mark_read(service, msg_id)
             return
 
+        updated = bool(wants_update and old)
         body_text = _tpl_confirm(
             name,
             plan.get("date_iso"),
             plan.get("time_24"),
             str(plan.get("party_size")),
             confirmation_code=code,
-            updated=bool(wants_update and old),
+            updated=updated,
         )
-        suffix = "— Reservation Updated" if (wants_update and old) else "— Reservation Confirmed"
 
+        subject_suffix = "— Reservation Updated" if updated else "— Reservation Confirmed"
         _send(
             service,
             from_email,
-            f"Re: {subj} {suffix}",
+            f"Re: {subj} {subject_suffix}",
             body_text,
             in_reply_to=mid,
             thread_id=thread_id,
         )
         print("[SENT] confirm ->", from_email)
 
-        if mid:
-            action = "update_confirm" if (wants_update and old) else "confirm"
-            c.execute(
-                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                (mid, action),
-            )
-            conn.commit()
-
-        _mark_read(service, gmail_msg_id)
+        _processed_put(conn, mid, "update_confirm" if updated else "confirm")
+        _mark_read(service, msg_id)
         return
 
     # 2) Ask missing details
-    if plan.get("action") == "ask_missing":
+    if action == "ask_missing":
         hd = bool(plan.get("date_iso"))
         ht = bool(plan.get("time_24"))
         hp = bool(plan.get("party_size"))
+
         _send(
             service,
             from_email,
@@ -732,18 +715,12 @@ def handle(service, conn, raw, thread_id, gmail_msg_id):
         )
         print("[SENT] missing ->", from_email)
 
-        if mid:
-            c.execute(
-                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                (mid, "ask_missing"),
-            )
-            conn.commit()
-
-        _mark_read(service, gmail_msg_id)
+        _processed_put(conn, mid, "ask_missing")
+        _mark_read(service, msg_id)
         return
 
     # 3) Feedback (auto-reply with coupon)
-    if plan.get("action") == "feedback":
+    if action == "feedback":
         print("[INFO] Feedback detected → Sending coupon reply")
 
         sentiment, score = analyze_sentiment_with_backoff(body)
@@ -760,55 +737,34 @@ def handle(service, conn, raw, thread_id, gmail_msg_id):
 
         log_feedback(conn, from_email, sentiment, score, discount, code, body, reply_body)
 
-        if mid:
-            c.execute(
-                "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-                (mid, "feedback"),
-            )
-            conn.commit()
-
-        _mark_read(service, gmail_msg_id)
+        _processed_put(conn, mid, "feedback")
+        _mark_read(service, msg_id)
         return
 
     # 4) Skip other
     print("[SKIP other] ->", from_email)
-    if mid:
-        c.execute(
-            "INSERT OR REPLACE INTO processed(message_id, action, processed_at) VALUES (?,?,datetime('now'))",
-            (mid, "skip"),
-        )
-        conn.commit()
-
-    _mark_read(service, gmail_msg_id)
-
-
-def send_pending(service, conn):
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id,to_email,subject,body,in_reply_to FROM drafts WHERE sent_at IS NULL ORDER BY id"
-    ).fetchall()
-    for did, to_email, subject, body, in_reply_to in rows:
-        _send(service, to_email, subject, body, in_reply_to=in_reply_to, thread_id=None)
-        c.execute("UPDATE drafts SET sent_at=datetime('now') WHERE id=?", (did,))
-        conn.commit()
-        print("[SENT draft]", did, "->", to_email)
+    _processed_put(conn, mid, "skip")
+    _mark_read(service, msg_id)
 
 
 def main():
+    print("✅ agent starting...")
+    print("✅ DATABASE_URL set:", bool(os.getenv("DATABASE_URL")))
+    print("✅ token.json exists:", os.path.exists("token.json"))
+    print("✅ client_secret.json exists:", os.path.exists("client_secret.json"))
+
     service = get_gmail_service()
+    prof = service.users().getProfile(userId="me").execute()
+    print("✅ Gmail account:", prof.get("emailAddress"))
+
     conn = _db()
 
-    import sys
-    if "--send-pending" in sys.argv:
-        send_pending(service, conn)
-        return
-
-    messages = _fetch_unseen(service)
+    messages = _fetch_unseen(service)  # list of (msg_id, thread_id, raw_bytes)
     print(f"[INFO] fetched {len(messages)} unread messages")
 
-    for gmail_msg_id, thread_id, raw in messages:
+    for msg_id, thread_id, raw in messages:
         try:
-            handle(service, conn, raw, thread_id, gmail_msg_id)
+            handle(service, conn, raw, thread_id, msg_id)
         except Exception as e:
             print("[ERR]", e)
 
